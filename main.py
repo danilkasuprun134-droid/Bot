@@ -38,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 # Токен берется из переменных окружения или указывается напрямую
 API_TOKEN = os.environ.get("BOT_TOKEN", "8920950826:AAFToXcVtHQmUOYl3nSdPTYFU5pElDfpwVs")
 MONOBANK_JAR = "https://send.monobank.ua/jar/8wVnXzoF3f"
+OWNER_USERNAME = "nlyxx2686"
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -60,11 +61,36 @@ boost_ideas = []
 pending_requests = {}
 
 
-def get_rank(user_id: int) -> int:
+def get_rank(user_id: int, username: str = None) -> int:
+    if username and username.lstrip('@').lower() == OWNER_USERNAME.lower():
+        return 10
     return user_ranks.get(user_id, 0)
 
 def get_user_roles(user_id: int) -> list:
     return user_roles.get(user_id, [])
+
+
+# --- ОБРАБОТЧИК ДОБАВЛЕНИЯ БОТА В ГРУППУ ---
+@dp.my_chat_member()
+async def bot_added_to_group(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status in ["member", "administrator"]:
+        inviter = event.from_user
+        inviter_id = inviter.id
+        inviter_username = inviter.username or inviter.full_name
+        
+        # Если пригласивший — не Владелец (у овнера 10 ранг)
+        if get_rank(inviter_id, inviter.username) < 10:
+            user_ranks[inviter_id] = 6
+            try:
+                await bot.send_message(
+                    event.chat.id,
+                    f"🎉 Спасибо за добавление бота в чат!\n"
+                    f"👑 Пользователю @{inviter_username} автоматически выдан <b>6 ранг (ГА)</b>!",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
 
 # --- МИДДЛВАРЬ ДЛЯ КАСТОМНЫХ КОМАНД (/cmd) ---
 @dp.message.middleware()
@@ -241,7 +267,7 @@ async def process_successful_payment(message: Message):
 # --- Ручная выдача VIP (10+ ранг) ---
 @dp.message(Command("givesvips"))
 async def cmd_givesvips(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) < 10:
+    if get_rank(message.from_user.id, message.from_user.username) < 10:
         return await message.answer("❌ Выдача VIP вручную доступна только администраторам 10+ ранга.")
     
     if not command.args or len(command.args.split()) < 2:
@@ -360,7 +386,7 @@ async def cmd_zayavka(message: Message):
         return await message.answer("❌ Команда `/zayavka` работает <b>строго в ЛС бота</b>!", parse_mode="HTML")
     
     user_id = message.from_user.id
-    rank = get_rank(user_id)
+    rank = get_rank(user_id, message.from_user.username)
     roles = get_user_roles(user_id)
     
     can_review_pvip = (rank >= 8)
@@ -399,7 +425,7 @@ async def cmd_zayavka(message: Message):
 # --- Обработка кликов по кнопкам заявок ---
 @dp.callback_query(F.data.startswith("approve_pvip_"))
 async def process_approve_pvip(callback: CallbackQuery):
-    if get_rank(callback.from_user.id) < 8:
+    if get_rank(callback.from_user.id, callback.from_user.username) < 8:
         return await callback.answer("❌ Одобрять заявки могут только администраторы 8+ ранга!", show_alert=True)
     
     target_id = int(callback.data.replace("approve_pvip_", ""))
@@ -416,7 +442,7 @@ async def process_approve_pvip(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("deny_pvip_"))
 async def process_deny_pvip(callback: CallbackQuery):
-    if get_rank(callback.from_user.id) < 8:
+    if get_rank(callback.from_user.id, callback.from_user.username) < 8:
         return await callback.answer("❌ Отклонять заявки могут только администраторы 8+ ранга!", show_alert=True)
     
     target_id = int(callback.data.replace("deny_pvip_", ""))
@@ -432,7 +458,7 @@ async def process_deny_pvip(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("approve_tc_"))
 async def process_approve_tc(callback: CallbackQuery):
     uid = callback.from_user.id
-    rank = get_rank(uid)
+    rank = get_rank(uid, callback.from_user.username)
     roles = get_user_roles(uid)
     
     if not (rank >= 8 or 1 in roles or 2 in roles or rank in [9, 10]):
@@ -453,7 +479,7 @@ async def process_approve_tc(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("deny_tc_"))
 async def process_deny_tc(callback: CallbackQuery):
     uid = callback.from_user.id
-    rank = get_rank(uid)
+    rank = get_rank(uid, callback.from_user.username)
     roles = get_user_roles(uid)
     
     if not (rank >= 8 or 1 in roles or 2 in roles or rank in [9, 10]):
@@ -503,7 +529,7 @@ async def cmd_top(message: Message):
 async def cmd_stats(message: Message):
     coins = user_coins.get(message.from_user.id, 0)
     rep = user_rep.get(message.from_user.id, 0)
-    rank = get_rank(message.from_user.id)
+    rank = get_rank(message.from_user.id, message.from_user.username)
     await message.answer(f"📊 <b>Статистика профиля:</b>\n• Монеты: {coins}\n• Репутация: {rep}\n• Админ-ранг: {rank}", parse_mode="HTML")
 
 @dp.message(Command("report"))
@@ -525,7 +551,8 @@ async def cmd_giverang(message: Message, command: CommandObject):
 
 @dp.message(Command("repgh"))
 async def cmd_repgh(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    if get_rank(message.from_user.id, message.from_user.username) < 8: 
+        return await message.answer("❌ Доступно с 8+ ранга.")
     if command.args and command.args.isdigit():
         role_id = int(command.args)
         user_roles.setdefault(message.from_user.id, []).append(role_id)
@@ -536,7 +563,7 @@ async def cmd_repgh(message: Message, command: CommandObject):
 @dp.message(Command("Global"))
 async def cmd_global(message: Message, command: CommandObject):
     if command.args and "news" in command.args:
-        if get_rank(message.from_user.id) < 10:
+        if get_rank(message.from_user.id, message.from_user.username) < 10:
             return await message.answer("❌ Строго 10 ранг!")
         
         rules_text = command.args.replace("news", "").strip() or "Создание твинков — Глобальный бан."
@@ -549,8 +576,9 @@ async def cmd_global(message: Message, command: CommandObject):
 # ==========================================
 
 async def main():
-    print("🤖 Бот успешно запущен и готовые обрабатывать заявки!")
+    print("🤖 Бот успешно запущен и готов обрабатывать заявки!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
