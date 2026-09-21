@@ -36,7 +36,7 @@ keep_alive()
 logging.basicConfig(level=logging.INFO)
 
 # Токен берется из переменных окружения или указывается напрямую
-API_TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА_ТУТ")
+API_TOKEN = os.environ.get("BOT_TOKEN", "8920950826:AAFToXcVtHQmUOYl3nSdPTYFU5pElDfpwVs")
 MONOBANK_JAR = "https://send.monobank.ua/jar/8wVnXzoF3f"
 
 bot = Bot(token=API_TOKEN)
