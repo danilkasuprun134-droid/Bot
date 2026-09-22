@@ -22,12 +22,16 @@ app = Flask('')
 def home():
     return "Bot is running online 24/7!"
 
+@app.route('/healthz')
+def healthz():
+    return "OK", 200
+
 def run():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run, daemon=True)
     t.start()
 
 keep_alive()
@@ -35,7 +39,6 @@ keep_alive()
 
 logging.basicConfig(level=logging.INFO)
 
-# Токен берется из переменных окружения или указывается напрямую
 API_TOKEN = os.environ.get("BOT_TOKEN", "8920950826:AAFToXcVtHQmUOYl3nSdPTYFU5pElDfpwVs")
 MONOBANK_JAR = "https://send.monobank.ua/jar/8wVnXzoF3f"
 OWNER_USERNAME = "nlyxx2686"
@@ -45,7 +48,7 @@ dp = Dispatcher()
 
 # --- ХРАНИЛИЩА ДАННЫХ (В ПАМЯТИ) ---
 user_ranks = {}           # {user_id: int_rank}
-user_roles = {}           # {user_id: [role_ids]} (специальные роли, например: 1, 2)
+user_roles = {}           # {user_id: [role_ids]} (например: 1, 2, 3, 4)
 user_lang = {}            # {user_id: 'ru'|'ua'|'en'}
 custom_aliases = {}       # {user_id: {alias: original_cmd}}
 chat_rules = {}           # {chat_id: rules_text}
@@ -54,11 +57,16 @@ user_coins = {}           # {user_id: coins}
 vip_users = {}            # {user_id: dict_info}
 used_pleasevip = set()    # {user_id}
 
+# Системы бана и заявок
+aban_list = set()         # {user_id} — список заблокированных через /aban
 reports_db = []
 boost_ideas = []
 
-# Активные заявки: {req_id: {"type": "pvip"|"tc", "user_id": int, "username": str, "target_username": str}}
+# Активные заявки: 
+# {req_id: {"type": "pvip"|"tc"|"unaban", "user_id": int, "username": str, ...}}
 pending_requests = {}
+# Голоса за снятие абан для ГА/ТС: {target_id: set(approver_ids)}
+unaban_votes = {}
 
 
 def get_rank(user_id: int, username: str = None) -> int:
@@ -69,27 +77,24 @@ def get_rank(user_id: int, username: str = None) -> int:
 def get_user_roles(user_id: int) -> list:
     return user_roles.get(user_id, [])
 
+def is_ts(user_id: int) -> bool:
+    roles = get_user_roles(user_id)
+    return 1 in roles or 2 in roles
 
-# --- ОБРАБОТЧИК ДОБАВЛЕНИЯ БОТА В ГРУППУ ---
-@dp.my_chat_member()
-async def bot_added_to_group(event: types.ChatMemberUpdated):
-    if event.new_chat_member.status in ["member", "administrator"]:
-        inviter = event.from_user
-        inviter_id = inviter.id
-        inviter_username = inviter.username or inviter.full_name
-        
-        # Если пригласивший — не Владелец (у овнера 10 ранг)
-        if get_rank(inviter_id, inviter.username) < 10:
-            user_ranks[inviter_id] = 6
-            try:
-                await bot.send_message(
-                    event.chat.id,
-                    f"🎉 Спасибо за добавление бота в чат!\n"
-                    f"👑 Пользователю @{inviter_username} автоматически выдан <b>6 ранг (ГА)</b>!",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+
+# --- МИДДЛВАРЬ ДЛЯ БЛОКИРОВКИ ABAN ---
+@dp.message.middleware()
+async def aban_check_middleware(handler, event: Message, data):
+    if event.from_user:
+        user_id = event.from_user.id
+        if user_id in aban_list:
+            # Если пользователь забанен, разрешаем только команду /zadan для подачи заявки
+            if event.text and event.text.startswith('/zadan'):
+                return await handler(event, data)
+            else:
+                await event.answer("🚫 <b>Ваш доступ к боту заблокирован системой /aban!</b>\nПодайте заявку на снятие с помощью команды <code>/zadan</code>.", parse_mode="HTML")
+                return
+    return await handler(event, data)
 
 
 # --- МИДДЛВАРЬ ДЛЯ КАСТОМНЫХ КОМАНД (/cmd) ---
@@ -107,6 +112,27 @@ async def alias_middleware(handler, event: Message, data):
             event.text = f"/{real_cmd}{rest_args}"
             
     return await handler(event, data)
+
+
+# --- ОБРАБОТЧИК ДОБАВЛЕНИЯ БОТА В ГРУППУ ---
+@dp.my_chat_member()
+async def bot_added_to_group(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status in ["member", "administrator"]:
+        inviter = event.from_user
+        inviter_id = inviter.id
+        inviter_username = inviter.username or inviter.full_name
+        
+        if get_rank(inviter_id, inviter.username) < 10:
+            user_ranks[inviter_id] = 6
+            try:
+                await bot.send_message(
+                    event.chat.id,
+                    f"🎉 Спасибо за добавление бота в чат!\n"
+                    f"👑 Пользователю @{inviter_username} автоматически выдан <b>6 ранг (ГА)</b>!",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
 
 # ==========================================
@@ -141,10 +167,10 @@ async def process_lang(callback: CallbackQuery):
 async def cmd_help(message: Message):
     text = "📋 <b>Полный список всех команд бота:</b>\n\n"
     text += "<b>1. Настройки:</b> /setting, /help, /help1..10\n"
-    text += "<b>2. Экономика и VIP:</b> /buyvip, /pleasevip, /givesvips (10+), /rep, /bonus, /cmd, /top, /tops, /stats, /shop, /eshop, /Gshop, /givemevip, /role shop, /my role, /create role, /money role, /role present, /duel, /transfer, /trade, /report\n"
-    text += "<b>3. Модерация и ТС:</b> /tc, /zayavka (в ЛС), /snick (1+), /rnick (2+), /gnick (2+), /staff (1+), /warn (4+), /mute (4+), /kick (4+), /ban (4+), /gban (6+), /news (6+)\n"
-    text += "<b>4. Логи и Управление:</b> /give book (5+), /give books (6+), /book (5+), /books (6+), /book global (7+), /mevip (8+), /checkreps (5+), /giverep (6+), /ungloballist (8+), /setaccess (9+), /giverang (5+), /ungiverang (5+), /setzam (9+), /unsetzam (9+), /givemegabonus (8+), /megabook (7+), /megabooks (7+), /history (7+), /gwarn (5+)\n"
-    text += "<b>5. Высшее руководство:</b> /givetex (7), /usgivetex, /Obnyl Money, /Obnyl, /Ogwarn, /Ogban, /unga, /givega, /repgh, /muterep, /bot boost, /checkrep, /checkboost, /glist (9+), /gwlist (9+), /Global news (10)\n\n"
+    text += "<b>2. Защита от слива:</b> /aban (1+), /zadan (1+), /aadan (6+)\n"
+    text += "<b>3. Экономика и VIP:</b> /buyvip, /pleasevip, /givesvips (10+), /rep, /bonus, /cmd, /top, /stats, /report\n"
+    text += "<b>4. Модерация и ТС:</b> /tc, /zayavka (в ЛС), /giverang (5+)\n"
+    text += "<b>5. Высшее руководство:</b> /repgh (8+), /Global news (10)\n\n"
     text += "💡 <i>Узнать доступные команды для уровня:</i> <code>/help1</code> ... <code>/help10</code>"
     await message.answer(text, parse_mode="HTML")
 
@@ -153,21 +179,240 @@ async def cmd_help_level(message: Message):
     lvl = int(message.text.replace("/help", ""))
     text = f"🛡️ <b>Команды, доступные для {lvl} ранга:</b>\n\n"
     
-    if lvl >= 1: text += "• /snick, /staff\n"
-    if lvl >= 2: text += "• /rnick, /gnick\n"
-    if lvl >= 4: text += "• /warn, /mute, /kick, /ban\n"
-    if lvl >= 5: text += "• /give book, /book, /checkreps, /giverang, /ungiverang, /gwarn\n"
-    if lvl >= 6: text += "• /gban, /news, /give books, /books, /giverep\n"
-    if lvl >= 7: text += "• /book global, /megabook, /megabooks, /history, /givetex\n"
-    if lvl >= 8: text += "• /mevip, /ungloballist, /givemegabonus, /Obnyl, /Ogwarn, /Ogban, /unga, /givega, /repgh, /muterep, /checkrep, /checkboost, /tc\n"
-    if lvl >= 9: text += "• /setaccess, /setzam, /unsetzam, /glist, /gwlist\n"
+    if lvl >= 1: text += "• /aban (экстренная блокировка), /zadan (заявка на разбан)\n"
+    if lvl >= 5: text += "• /giverang\n"
+    if lvl >= 6: text += "• /aadan (просмотр заявок на разбан)\n"
+    if lvl >= 8: text += "• /repgh\n"
     if lvl >= 10: text += "• /Global news, /givesvips\n"
     
     await message.answer(text, parse_mode="HTML")
 
 
 # ==========================================
-# 2. ПОКУПКА VIP И СИСТЕМА VIP (/buyvip, /pleasevip, /givesvips)
+# 2. ЭКСТРЕННАЯ БЛОКИРОВКА И СНЯТИЕ (/aban, /zadan, /aadan)
+# ==========================================
+
+@dp.message(Command("aban"))
+async def cmd_aban(message: Message, command: CommandObject):
+    sender_id = message.from_user.id
+    sender_rank = get_rank(sender_id, message.from_user.username)
+    
+    if sender_rank < 1:
+        return await message.answer("❌ Экстренная блокировка доступна с 1 ранга.")
+    
+    target_id = None
+    target_name = ""
+    
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        target_name = message.reply_to_message.from_user.full_name
+    elif command.args:
+        arg = command.args.split()[0]
+        if arg.isdigit():
+            target_id = int(arg)
+            target_name = f"ID: {target_id}"
+            
+    if not target_id:
+        return await message.answer("⚠️ <b>Использование:</b> ответьте на сообщение сливщика или введите: <code>/aban [user_id]</code>", parse_mode="HTML")
+        
+    if target_id == sender_id and sender_rank == 10:
+        return await message.answer("❌ Создатель бота не может заблокировать сам себя!")
+
+    aban_list.add(target_id)
+    await message.answer(
+        f"🚨 <b>СЛЕДСТВЕННАЯ ЗАЩИТА АКТИВИРОВАНА!</b>\n\n"
+        f"Пользователю <b>{target_name}</b> (<code>{target_id}</code>) мгновенно заблокирован доступ ко всем функциям бота во избежание слива.\n"
+        f"Для разблокировки пользователь должен подать заявку: <code>/zadan</code>.",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("zadan"))
+async def cmd_zadan(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in aban_list:
+        return await message.answer("❌ Вы не находитесь в списке заблокированных (/aban).")
+        
+    req_id = f"unaban_{user_id}"
+    if req_id in pending_requests:
+        return await message.answer("⏳ Ваша заявка на снятие блокировки уже находится на рассмотрении!")
+
+    rank = get_rank(user_id, message.from_user.username)
+    user_is_ts = is_ts(user_id)
+    
+    pending_requests[req_id] = {
+        "type": "unaban",
+        "user_id": user_id,
+        "username": message.from_user.username or message.from_user.full_name,
+        "rank": rank,
+        "is_ts": user_is_ts
+    }
+    
+    await message.answer("📩 Ваша заявка на снятие экстренной блокировки создана и передана руководству!")
+    
+    # Оповещение модераторов
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Снять ABAN", callback_data=f"approve_unaban_{user_id}"),
+        InlineKeyboardButton(text="❌ Оставить ABAN", callback_data=f"deny_unaban_{user_id}")
+    ]])
+    
+    text = (
+        f"🚨 <b>[ЗАЯВКА НА СНЯТИЕ ABAN]</b>\n\n"
+        f"• Пользователь: @{message.from_user.username or 'без_юзернейма'}\n"
+        f"• ID: <code>{user_id}</code>\n"
+        f"• Ранг: <b>{rank}</b> | ТС: <b>{'Да' if user_is_ts else 'Нет'}</b>"
+    )
+    
+    # Рассылка в зависимости от уровня забаненного
+    notified = set()
+    if rank < 6 and not user_is_ts:
+        # Для <5 лвл: уведомляем ГА (6+) и ТС (роль 1,2)
+        for uid, r in user_ranks.items():
+            if r >= 6: notified.add(uid)
+        for uid, roles in user_roles.items():
+            if 1 in roles or 2 in roles: notified.add(uid)
+    elif rank in [6, 7] or user_is_ts:
+        # Для ГА/ТС: уведомляем роли 3 и 4
+        for uid, roles in user_roles.items():
+            if 3 in roles or 4 in roles: notified.add(uid)
+    else:
+        # Для 8+ лвл: уведомляем 8+ лвл
+        for uid, r in user_ranks.items():
+            if r >= 8: notified.add(uid)
+
+    for admin_id in notified:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+
+@dp.message(Command("aadan"))
+async def cmd_aadan(message: Message):
+    if message.chat.type != "private":
+        return await message.answer("❌ Команда `/aadan` работает <b>строго в ЛС бота</b>!", parse_mode="HTML")
+        
+    uid = message.from_user.id
+    rank = get_rank(uid, message.from_user.username)
+    roles = get_user_roles(uid)
+    
+    if rank < 6 and not is_ts(uid) and 3 not in roles and 4 not in roles:
+        return await message.answer("❌ Доступ к проверке заявок на снятие ABAN запрещен.")
+        
+    count = 0
+    await message.answer("🔍 <b>Проверка активных заявок на снятие ABAN...</b>", parse_mode="HTML")
+    
+    for req_id, req in list(pending_requests.items()):
+        if req["type"] == "unaban":
+            count += 1
+            target_id = req["user_id"]
+            votes = len(unaban_votes.get(target_id, set()))
+            req_info = f" (Голосов от 3/4 ролей: {votes}/3)" if (req["rank"] in [6, 7] or req["is_ts"]) else ""
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Снять ABAN", callback_data=f"approve_unaban_{target_id}"),
+                InlineKeyboardButton(text="❌ Оставить ABAN", callback_data=f"deny_unaban_{target_id}")
+            ]])
+            
+            await message.answer(
+                f"🚨 <b>Заявка от @{req['username']}</b> (ID: <code>{target_id}</code>)\n"
+                f"Ранг: {req['rank']}{req_info}",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            
+    if count == 0:
+        await message.answer("🎉 Активных заявок на снятие ABAN нет!")
+
+@dp.callback_query(F.data.startswith("approve_unaban_"))
+async def process_approve_unaban(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    admin_rank = get_rank(admin_id, callback.from_user.username)
+    admin_roles = get_user_roles(admin_id)
+    
+    target_id = int(callback.data.replace("approve_unaban_", ""))
+    req_id = f"unaban_{target_id}"
+    req = pending_requests.get(req_id)
+    
+    if not req:
+        return await callback.answer("❌ Заявка не найдена или уже обработана.", show_alert=True)
+        
+    target_rank = req["rank"]
+    target_is_ts = req["is_ts"]
+    
+    # Запрет снимать с себя
+    if admin_id == target_id:
+        return await callback.answer("❌ Нельзя одобрить снятие бана самому себе!", show_alert=True)
+
+    # Логика 1: Для обычных пользователей (до 5 ранга) -> ГА (6+) или ТС
+    if target_rank < 6 and not target_is_ts:
+        if admin_rank < 6 and not is_ts(admin_id):
+            return await callback.answer("❌ Для снятия требуется одобрение ГА (6+ ранг) или ТС!", show_alert=True)
+            
+        aban_list.discard(target_id)
+        pending_requests.pop(req_id, None)
+        try:
+            await callback.bot.send_message(target_id, "🎉 <b>Ваш ABAN был успешно снят администратором!</b>", parse_mode="HTML")
+        except Exception:
+            pass
+        return await callback.message.edit_text(f"✅ **ABAN снят** с пользователя <code>{target_id}</code>.", parse_mode="HTML")
+
+    # Логика 2: Для ГА (6-7 ранг) или ТС -> требуется 3 одобрения от ролей 3 или 4
+    elif target_rank in [6, 7] or target_is_ts:
+        if 3 not in admin_roles and 4 not in admin_roles:
+            return await callback.answer("❌ Для снятия ABAN с ГА/ТС требуется одобрение от владельцев 3 или 4 роли!", show_alert=True)
+            
+        voters = unaban_votes.setdefault(target_id, set())
+        voters.add(admin_id)
+        
+        if len(voters) >= 3:
+            aban_list.discard(target_id)
+            pending_requests.pop(req_id, None)
+            unaban_votes.pop(target_id, None)
+            try:
+                await callback.bot.send_message(target_id, "🎉 **Ваш ABAN был снят по решению 3 администраторов (3/4 роли)!**", parse_mode="HTML")
+            except Exception:
+                pass
+            return await callback.message.edit_text(f"✅ **ABAN успешно снят!** Получено {len(voters)}/3 необходимых голосов.", parse_mode="HTML")
+        else:
+            return await callback.answer(f"✅ Ваш голос учтен! Запущено голосов: {len(voters)}/3", show_alert=True)
+
+    # Логика 3: Для Руководства (8+ ранг) -> требуется одобрение 8+
+    else:
+        if admin_rank < 8:
+            return await callback.answer("❌ Снять ABAN с руководства может только админ 8+ ранга!", show_alert=True)
+            
+        aban_list.discard(target_id)
+        pending_requests.pop(req_id, None)
+        try:
+            await callback.bot.send_message(target_id, "🎉 **Ваш ABAN был снят Руководством!**", parse_mode="HTML")
+        except Exception:
+            pass
+        return await callback.message.edit_text(f"✅ **ABAN снят** с руководителя <code>{target_id}</code>.", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("deny_unaban_"))
+async def process_deny_unaban(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    admin_rank = get_rank(admin_id, callback.from_user.username)
+    
+    if admin_rank < 6 and not is_ts(admin_id):
+        return await callback.answer("❌ У вас недостаточно прав для отклонения этой заявки.", show_alert=True)
+        
+    target_id = int(callback.data.replace("deny_unaban_", ""))
+    req_id = f"unaban_{target_id}"
+    
+    pending_requests.pop(req_id, None)
+    unaban_votes.pop(target_id, None)
+    
+    try:
+        await callback.bot.send_message(target_id, "❌ Ваша заявка на снятие ABAN была отклонена.")
+    except Exception:
+        pass
+        
+    await callback.message.edit_text(f"❌ Заявка на снятие ABAN для <code>{target_id}</code> была отклонена.", parse_mode="HTML")
+
+
+# ==========================================
+# 3. ПОКУПКА VIP И СИСТЕМА VIP (/buyvip, /pleasevip, /givesvips)
 # ==========================================
 
 def get_buyvip_kb():
@@ -264,7 +509,6 @@ async def process_successful_payment(message: Message):
     vip_users[message.from_user.id] = {"type": "paid"}
     await message.answer("🎉 <b>Оплата прошла успешно! VIP-статус активирован!</b>", parse_mode="HTML")
 
-# --- Ручная выдача VIP (10+ ранг) ---
 @dp.message(Command("givesvips"))
 async def cmd_givesvips(message: Message, command: CommandObject):
     if get_rank(message.from_user.id, message.from_user.username) < 10:
@@ -273,7 +517,7 @@ async def cmd_givesvips(message: Message, command: CommandObject):
     if not command.args or len(command.args.split()) < 2:
         return await message.answer(
             "⚠️ <b>Использование:</b>\n"
-            "<code>/givesvips @username [количество месяцев (1-12) или forever]</code>\n\n"
+            "<code>/givesvips @username [месяцев (1-12) или forever]</code>\n\n"
             "Пример: <code>/givesvips @durov 3</code> или <code>/givesvips @durov forever</code>",
             parse_mode="HTML"
         )
@@ -291,7 +535,6 @@ async def cmd_givesvips(message: Message, command: CommandObject):
     
     await message.answer(f"✅ Пользователю <b>{target_username}</b> успешно выдан VIP-статус {duration_str}!", parse_mode="HTML")
 
-# --- Заявка на пробный VIP (/pleasevip) ---
 @dp.message(Command("pleasevip"))
 async def cmd_pleasevip(message: Message):
     user_id = message.from_user.id
@@ -313,7 +556,6 @@ async def cmd_pleasevip(message: Message):
     
     await message.answer("📩 Ваша заявка на бесплатный VIP (5 дней) отправлена администраторам в ЛС.")
     
-    # Отправка уведомления администраторам (8+) в ЛС
     for admin_id, rank in user_ranks.items():
         if rank >= 8:
             try:
@@ -330,7 +572,7 @@ async def cmd_pleasevip(message: Message):
 
 
 # ==========================================
-# 3. СИСТЕМА ЗАЯВОК НА ТС (/tc) И КУРАТОРСКАЯ КОМАНДА /zayavka
+# 4. СИСТЕМА ЗАЯВОК НА ТС (/tc) И КУРАТОРСКАЯ КОМАНДА /zayavka
 # ==========================================
 
 @dp.message(Command("tc"))
@@ -356,7 +598,6 @@ async def cmd_tc(message: Message, command: CommandObject):
     
     await message.answer("📩 Ваша заявка на ТС успешно отправлена руководству в ЛС!")
     
-    # Рассылка в ЛС админам 8+ или владельцам спец-ролей 1 и 2
     notified_users = set()
     for uid, rank in user_ranks.items():
         if rank >= 8:
@@ -379,7 +620,6 @@ async def cmd_tc(message: Message, command: CommandObject):
         except Exception:
             pass
 
-# --- Просмотр всех открытых заявок strictly в ЛС (/zayavka) ---
 @dp.message(Command("zayavka"))
 async def cmd_zayavka(message: Message):
     if message.chat.type != "private":
@@ -401,28 +641,23 @@ async def cmd_zayavka(message: Message):
     for req_id, req in list(pending_requests.items()):
         if req["type"] == "pvip" and can_review_pvip:
             count += 1
-            text += f"🔹 <b>VIP (5 дней)</b> от @{req['username']} (ID: <code>{req['user_id']}</code>)\n"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_pvip_{req['user_id']}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_pvip_{req['user_id']}")
             ]])
-            await message.answer(f"Заявка VIP от @{req['username']}:", reply_markup=kb)
+            await message.answer(f"🔹 <b>VIP (5 дней)</b> от @{req['username']} (ID: <code>{req['user_id']}</code>)", reply_markup=kb, parse_mode="HTML")
             
         elif req["type"] == "tc" and can_review_tc:
             count += 1
-            text += f"🔹 <b>Заявка на ТС</b> от @{req['username']} для <b>{req['target_username']}</b>\n"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Согласиться", callback_data=f"approve_tc_{req_id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_tc_{req_id}")
             ]])
-            await message.answer(f"Заявка ТС для {req['target_username']}:", reply_markup=kb)
+            await message.answer(f"🔹 <b>Заявка на ТС</b> от @{req['username']} для <b>{req['target_username']}</b>", reply_markup=kb, parse_mode="HTML")
             
     if count == 0:
         await message.answer("🎉 Нет активных заявок для вашего уровня доступа!")
-    else:
-        await message.answer(f"📊 Всего доступных заявок: <b>{count}</b>", parse_mode="HTML")
 
-# --- Обработка кликов по кнопкам заявок ---
 @dp.callback_query(F.data.startswith("approve_pvip_"))
 async def process_approve_pvip(callback: CallbackQuery):
     if get_rank(callback.from_user.id, callback.from_user.username) < 8:
@@ -434,11 +669,11 @@ async def process_approve_pvip(callback: CallbackQuery):
     pending_requests.pop(f"pvip_{target_id}", None)
     
     try:
-        await callback.bot.send_message(target_id, "🎉 <b>Ваша заявка одобрена!</b> Вам автоматически выдан VIP-статус на 5 дней.", parse_mode="HTML")
+        await callback.bot.send_message(target_id, "🎉 <b>Ваша заявка одобрена!</b> Вам выдан VIP-статус на 5 дней.", parse_mode="HTML")
     except Exception:
         pass
         
-    await callback.message.edit_text(f"✅ <b>Заявка одобрена!</b> Пользователю (ID: <code>{target_id}</code>) автоматически выдан VIP на 5 дней.", parse_mode="HTML")
+    await callback.message.edit_text(f"✅ <b>Заявка одобрена!</b> Пользователю (ID: <code>{target_id}</code>) выдан VIP на 5 дней.", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("deny_pvip_"))
 async def process_deny_pvip(callback: CallbackQuery):
@@ -449,7 +684,7 @@ async def process_deny_pvip(callback: CallbackQuery):
     pending_requests.pop(f"pvip_{target_id}", None)
     
     try:
-        await callback.bot.send_message(target_id, "❌ Ваша заявка на бесплатный VIP была отклонена администрацией.")
+        await callback.bot.send_message(target_id, "❌ Ваша заявка на бесплатный VIP была отклонена.")
     except Exception:
         pass
         
@@ -470,7 +705,7 @@ async def process_approve_tc(callback: CallbackQuery):
     target_str = req_data['target_username'] if req_data else "пользователя"
     if req_data:
         try:
-            await callback.bot.send_message(req_data['user_id'], f"🎉 <b>Ваша заявка на ТС для {target_str} была успешно ОДОБРЕНА!</b>", parse_mode="HTML")
+            await callback.bot.send_message(req_data['user_id'], f"🎉 <b>Ваша заявка на ТС для {target_str} была ОДОБРЕНА!</b>", parse_mode="HTML")
         except Exception:
             pass
             
@@ -499,7 +734,7 @@ async def process_deny_tc(callback: CallbackQuery):
 
 
 # ==========================================
-# 4. ЭКОНОМИКА, МОДЕРАЦИЯ И ДРУГИЕ КОМАНДЫ
+# 5. ЭКОНОМИКА, МОДЕРАЦИЯ И ДРУГИЕ КОМАНДЫ
 # ==========================================
 
 @dp.message(Command("cmd"))
@@ -581,4 +816,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
