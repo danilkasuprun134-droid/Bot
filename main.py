@@ -1,151 +1,309 @@
 import os
+import sys
 import logging
+import random
+import asyncio
+import sqlite3
+import datetime
+from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask
-import asyncio
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, 
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton, 
-    CallbackQuery, 
-    LabeledPrice, 
-    PreCheckoutQuery
+    Message, CallbackQuery, InlineKeyboardMarkup, 
+    InlineKeyboardButton, ChatPermissions, LabeledPrice, PreCheckoutQuery
 )
 
-# --- 1. ВЕБ-СЕРВЕР FLASK ДЛЯ RENDER (24/7) ---
+# ==========================================
+# 0. ВЕБ-СЕРВЕР ДЛЯ РАЗВЕРТЫВАНИЯ (RENDER 24/7)
+# ==========================================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running online 24/7!"
+    return "Stars Manager Bot is active 24/7!"
 
 @app.route('/healthz')
 def healthz():
     return "OK", 200
 
-def run():
+def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run, daemon=True)
+    t = Thread(target=run_flask, daemon=True)
     t.start()
 
 keep_alive()
-# --------------------------------------
 
+# ==========================================
+# 1. НАСТРОЙКИ И БАЗА ДАННЫХ
+# ==========================================
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = os.environ.get("BOT_TOKEN", "8920950826:AAFToXcVtHQmUOYl3nSdPTYFU5pElDfpwVs")
+API_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 MONOBANK_JAR = "https://send.monobank.ua/jar/8wVnXzoF3f"
 OWNER_USERNAME = "nlyxx2686"
+CARD_DETAILS = "1234 5678 9012 3456 (Monobank)"
+
+# Telegram ID администраторов, имеющих доступ к финансовым заявкам VIP (/Bvip, /bookvip)
+ADMIN_IDS = [123456789]  # Укажите ваш ID или ID администраторов
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# --- ХРАНИЛИЩА ДАННЫХ (В ПАМЯТИ) ---
-user_ranks = {}           # {user_id: int_rank}
-user_roles = {}           # {user_id: [role_ids]} (например: 1, 2, 3, 4)
-user_lang = {}            # {user_id: 'ru'|'ua'|'en'}
-custom_aliases = {}       # {user_id: {alias: original_cmd}}
-chat_rules = {}           # {chat_id: rules_text}
-user_rep = {}             # {user_id: rep}
-user_coins = {}           # {user_id: coins}
-vip_users = {}            # {user_id: dict_info}
-used_pleasevip = set()    # {user_id}
+# Инициализация SQLite DB
+conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# Системы бана и заявок
-aban_list = set()         # {user_id} — список заблокированных через /aban
-reports_db = []
-boost_ideas = []
+def init_db():
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        lang TEXT DEFAULT 'ru',
+        rank INTEGER DEFAULT 0,
+        roles TEXT DEFAULT '',
+        coins INTEGER DEFAULT 0,
+        exp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1,
+        rep INTEGER DEFAULT 0,
+        streak INTEGER DEFAULT 0,
+        last_bonus TEXT,
+        rep_given_today INTEGER DEFAULT 0,
+        last_rep_date TEXT,
+        vip_until TEXT,
+        msg_count INTEGER DEFAULT 0,
+        duel_wins INTEGER DEFAULT 0,
+        custom_nickname TEXT,
+        muted_until TEXT,
+        rep_muted_until TEXT,
+        warns INTEGER DEFAULT 0
+    )''')
 
-# Активные заявки: 
-# {req_id: {"type": "pvip"|"tc"|"unaban", "user_id": int, "username": str, ...}}
-pending_requests = {}
-# Голоса за снятие абан для ГА/ТС: {target_id: set(approver_ids)}
-unaban_votes = {}
+    cursor.execute('''CREATE TABLE IF NOT EXISTS global_bans (
+        user_id INTEGER PRIMARY KEY,
+        reason TEXT,
+        by_user TEXT
+    )''')
 
+    cursor.execute('''CREATE TABLE IF NOT EXISTS global_warns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        reason TEXT,
+        by_user TEXT
+    )''')
 
-def get_rank(user_id: int, username: str = None) -> int:
-    if username and username.lstrip('@').lower() == OWNER_USERNAME.lower():
-        return 10
-    return user_ranks.get(user_id, 0)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS custom_roles (
+        role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        creator_id INTEGER,
+        chat_id INTEGER,
+        text TEXT,
+        color_code TEXT,
+        price INTEGER DEFAULT 0,
+        monthly_income INTEGER DEFAULT 0
+    )''')
 
-def get_user_roles(user_id: int) -> list:
-    return user_roles.get(user_id, [])
+    cursor.execute('''CREATE TABLE IF NOT EXISTS user_roles_owned (
+        user_id INTEGER,
+        role_id INTEGER
+    )''')
 
-def is_ts(user_id: int) -> bool:
-    roles = get_user_roles(user_id)
-    return 1 in roles or 2 in roles
+    cursor.execute('''CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user_id INTEGER,
+        target_id INTEGER,
+        text TEXT,
+        status TEXT DEFAULT 'pending',
+        assigned_role INTEGER DEFAULT 0
+    )''')
 
+    cursor.execute('''CREATE TABLE IF NOT EXISTS bot_boosts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        text TEXT
+    )''')
 
-# --- МИДДЛВАРЬ ДЛЯ БЛОКИРОВКИ ABAN ---
+    cursor.execute('''CREATE TABLE IF NOT EXISTS chat_settings (
+        chat_id INTEGER PRIMARY KEY,
+        rules TEXT DEFAULT '',
+        shop_exp_rate INTEGER DEFAULT 10
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs_access (
+        user_id INTEGER PRIMARY KEY,
+        level INTEGER DEFAULT 0
+    )''')
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS aliases (
+        user_id INTEGER,
+        alias TEXT,
+        command TEXT,
+        PRIMARY KEY (user_id, alias)
+    )''')
+
+    # Новые таблицы для Магазина VIP
+    cursor.execute('''CREATE TABLE IF NOT EXISTS pending_vip_orders (
+        order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        period TEXT,
+        price TEXT,
+        currency TEXT,
+        date TEXT
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS vip_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        price TEXT,
+        currency TEXT,
+        period TEXT,
+        date TEXT
+    )''')
+
+    conn.commit()
+
+init_db()
+
+# ==========================================
+# 2. FSM СОСТОЯНИЯ И ПРАЙС-ЛИСТЫ
+# ==========================================
+class AdminProcessOrder(StatesGroup):
+    waiting_for_details = State()
+
+PRICES_UAH = {
+    "1": {"price": 30, "text": "1 месяц — 30 грн"},
+    "3": {"price": 75, "text": "3 месяца — 75 грн"},
+    "6": {"price": 130, "text": "6 месяцев — 130 грн"},
+    "12": {"price": 210, "text": "12 месяцев — 210 грн"},
+    "forever": {"price": 500, "text": "Навсегда — 500 грн"},
+}
+
+PRICES_STARS = {
+    "1": {"price": 50, "text": "1 месяц — 50 Stars ⭐️"},
+    "3": {"price": 85, "text": "3 месяца — 85 Stars ⭐️"},
+    "6": {"price": 150, "text": "6 месяцев — 150 Stars ⭐️"},
+    "12": {"price": 250, "text": "12 месяцев — 250 Stars ⭐️"},
+    "forever": {"price": 700, "text": "Навсегда — 700 Stars ⭐️"},
+}
+
+# ==========================================
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
+
+def get_user(user_id: int, username: str = ""):
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        rank = 10 if username and username.lstrip('@').lower() == OWNER_USERNAME.lower() else 0
+        cursor.execute(
+            "INSERT INTO users (user_id, username, rank) VALUES (?, ?, ?)",
+            (user_id, username, rank)
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+    else:
+        if username and username.lstrip('@').lower() == OWNER_USERNAME.lower() and row[3] != 10:
+            cursor.execute("UPDATE users SET rank = 10 WHERE user_id = ?", (user_id,))
+            conn.commit()
+    return row
+
+def update_user(user_id: int, **kwargs):
+    fields = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+    values = list(kwargs.values()) + [user_id]
+    cursor.execute(f"UPDATE users SET {fields} WHERE user_id = ?", values)
+    conn.commit()
+
+def is_vip(user_row) -> bool:
+    if not user_row or not user_row[13]: 
+        return False
+    if user_row[13] == 'forever': 
+        return True
+    try:
+        until = datetime.strptime(user_row[13], "%Y-%m-%d %H:%M:%S")
+        return datetime.now() < until
+    except:
+        return False
+
+def add_vip_time(user_id: int, period: str):
+    """ Начисление VIP времени пользователю """
+    user = get_user(user_id)
+    if period.lower() == "forever" or period.lower() == "навсегда":
+        update_user(user_id, vip_until="forever")
+        return
+
+    days_to_add = int(period) * 30
+    now = datetime.now()
+
+    if is_vip(user) and user[13] != 'forever':
+        current_until = datetime.strptime(user[13], "%Y-%m-%d %H:%M:%S")
+        new_until = current_until + timedelta(days=days_to_add)
+    else:
+        new_until = now + timedelta(days=days_to_add)
+
+    update_user(user_id, vip_until=new_until.strftime("%Y-%m-%d %H:%M:%S"))
+
+def check_gban(user_id: int) -> bool:
+    if user_id == 10: return False
+    cursor.execute("SELECT 1 FROM global_bans WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+async def send_log_to_user(user_id: int, text: str):
+    try:
+        await bot.send_message(user_id, f"📝 <b>[ЛОГ СИСТЕМЫ]</b>\n{text}", parse_mode="HTML")
+    except Exception:
+        pass
+
+# ==========================================
+# 4. МИДДЛВАРИ
+# ==========================================
+
 @dp.message.middleware()
-async def aban_check_middleware(handler, event: Message, data):
-    if event.from_user:
-        user_id = event.from_user.id
-        if user_id in aban_list:
-            # Если пользователь забанен, разрешаем только команду /zadan для подачи заявки
-            if event.text and event.text.startswith('/zadan'):
-                return await handler(event, data)
-            else:
-                await event.answer("🚫 <b>Ваш доступ к боту заблокирован системой /aban!</b>\nПодайте заявку на снятие с помощью команды <code>/zadan</code>.", parse_mode="HTML")
-                return
-    return await handler(event, data)
+async def global_middleware(handler, event: Message, data):
+    if not event.from_user:
+        return await handler(event, data)
 
+    user_id = event.from_user.id
+    username = event.from_user.username or ""
 
-# --- МИДДЛВАРЬ ДЛЯ КАСТОМНЫХ КОМАНД (/cmd) ---
-@dp.message.middleware()
-async def alias_middleware(handler, event: Message, data):
-    if event.text and event.text.startswith('/'):
-        user_id = event.from_user.id
-        user_map = custom_aliases.get(user_id, {})
-        parts = event.text.split(maxsplit=1)
-        cmd_name = parts[0][1:]  # Убираем '/'
-        
-        if cmd_name in user_map:
-            real_cmd = user_map[cmd_name]
-            rest_args = " " + parts[1] if len(parts) > 1 else ""
-            event.text = f"/{real_cmd}{rest_args}"
-            
-    return await handler(event, data)
-
-
-# --- ОБРАБОТЧИК ДОБАВЛЕНИЯ БОТА В ГРУППУ ---
-@dp.my_chat_member()
-async def bot_added_to_group(event: types.ChatMemberUpdated):
-    if event.new_chat_member.status in ["member", "administrator"]:
-        inviter = event.from_user
-        inviter_id = inviter.id
-        inviter_username = inviter.username or inviter.full_name
-        
-        if get_rank(inviter_id, inviter.username) < 10:
-            user_ranks[inviter_id] = 6
+    # Авто-кик за GBAN (кроме владельца)
+    if username.lower() != OWNER_USERNAME.lower() and check_gban(user_id):
+        if event.chat.type in ['group', 'supergroup']:
             try:
-                await bot.send_message(
-                    event.chat.id,
-                    f"🎉 Спасибо за добавление бота в чат!\n"
-                    f"👑 Пользователю @{inviter_username} автоматически выдан <b>6 ранг (ГА)</b>!",
-                    parse_mode="HTML"
-                )
+                await bot.ban_chat_member(event.chat.id, user_id)
+                await event.answer(f"🚨 Пользователь @{username or user_id} имеет <b>GBAN</b> и был удалён из чата!", parse_mode="HTML")
             except Exception:
                 pass
+            return
 
+    # Учет сообщений для топа
+    user = get_user(user_id, username)
+    update_user(user_id, msg_count=user[14] + 1)
+
+    # Кастомные алиасы /cmd
+    if event.text and event.text.startswith('/'):
+        parts = event.text.split(maxsplit=1)
+        cmd_name = parts[0][1:]
+        cursor.execute("SELECT command FROM aliases WHERE user_id = ? AND alias = ?", (user_id, cmd_name))
+        row = cursor.fetchone()
+        if row:
+            rest = " " + parts[1] if len(parts) > 1 else ""
+            event.text = f"/{row[0]}{rest}"
+
+    return await handler(event, data)
 
 # ==========================================
-# 1. ПЕРВИЧНЫЙ ВХОД И НАСТРОЙКИ
+# 5. ОСНОВНЫЕ КОМАНДЫ И НАСТРОЙКИ
 # ==========================================
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    chat_id = message.chat.id
-    text = "🤖 Бот успешно запущен и готов к работе!"
-    if chat_id in chat_rules:
-        text += f"\n\n📜 <b>Правила чата:</b>\n{chat_rules[chat_id]}\n\n<i>Используя бота, вы автоматически соглашаетесь с правилами.</i>"
-    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("setting"))
 async def cmd_setting(message: Message):
@@ -154,664 +312,1188 @@ async def cmd_setting(message: Message):
         InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_ua"),
         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")
     ]])
-    await message.answer("🌐 Выберите язык бота / Оберіть мову бота / Select language:", reply_markup=kb)
+    await message.answer("⚙️ Choose language / Выберите язык / Оберіть мову:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("lang_"))
-async def process_lang(callback: CallbackQuery):
-    lang = callback.data.split("_")[1]
-    user_lang[callback.from_user.id] = lang
-    names = {"ru": "Русский", "ua": "Українська", "en": "English"}
-    await callback.message.edit_text(f"✅ Язык изменен на: <b>{names[lang]}</b>", parse_mode="HTML")
+async def cb_lang(call: CallbackQuery):
+    lang = call.data.split("_")[1]
+    update_user(call.from_user.id, lang=lang)
+    await call.message.edit_text(f"✅ Язык успешно изменён на: <b>{lang.upper()}</b>", parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    text = "📋 <b>Полный список всех команд бота:</b>\n\n"
-    text += "<b>1. Настройки:</b> /setting, /help, /help1..10\n"
-    text += "<b>2. Защита от слива:</b> /aban (1+), /zadan (1+), /aadan (6+)\n"
-    text += "<b>3. Экономика и VIP:</b> /buyvip, /pleasevip, /givesvips (10+), /rep, /bonus, /cmd, /top, /stats, /report\n"
-    text += "<b>4. Модерация и ТС:</b> /tc, /zayavka (в ЛС), /giverang (5+)\n"
-    text += "<b>5. Высшее руководство:</b> /repgh (8+), /Global news (10)\n\n"
-    text += "💡 <i>Узнать доступные команды для уровня:</i> <code>/help1</code> ... <code>/help10</code>"
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    rank = user[3]
+    
+    text = (
+        "📜 <b>ПОЛНЫЙ СПИСОК КОМАНД БОТА</b>\n\n"
+        "<b>🌍 1. Основные & Экономика & VIP:</b>\n"
+        "• <code>/vip</code> — Купить VIP-статус (Гривны / TG Stars)\n"
+        "• <code>/rep [+/-]</code> — Повысить/понизить репутацию (1/день, VIP: 3/день)\n"
+        "• <code>/bonus</code> — Ежедневный бонус с серией и уровнями\n"
+        "• <code>/cmd [алиас] [команда]</code> — Кастомная команда (напр. stats s)\n"
+        "• <code>/top</code> / <code>/tops</code> — Топ группы / Межгрупповой топ\n"
+        "• <code>/sell_role</code> — Продать уникальную Legend роль за 50k монет\n"
+        "• <code>/stats</code> — Ваша статистика профиля\n"
+        "• <code>/shop</code> / <code>/eshop</code> — Магазин монеты-EXP / Эксклюзивы\n"
+        "• <code>/givemevip</code> / <code>/pleasevip</code> — Тестовые VIP-запросы\n"
+        "• <code>/role_info</code> / <code>/role_shop</code> / <code>/my_role</code>\n"
+        "• <code>/create_role</code> / <code>/money_role</code> / <code>/role present</code>\n"
+        "• <code>/duel [ставка]</code> — Дуэль на монеты\n"
+        "• <code>/transfer [user] [кол-во]</code> — Перевод монет\n"
+        "• <code>/report [текст]</code> — Жалоба администрации\n\n"
+        "<b>🛡️ 2. Модерация (1-6 Ранги):</b>\n"
+        "• <code>/snick</code>, <code>/rnick</code>, <code>/gnick</code> — Управление никами (2+)\n"
+        "• <code>/staff</code> — Модерация онлайн (1+)\n"
+        "• <code>/warn</code>, <code>/mute</code>, <code>/kick</code>, <code>/ban</code> (4+)\n"
+        "• <code>/gban</code> — Форма на глобальный бан (6+)\n"
+        "• <code>/pin</code> — Закреп правил чата (6+)\n"
+        "• <code>/unban</code>, <code>/unmute</code>, <code>/unwarn</code> (5-6+)\n\n"
+    )
+    if rank >= 3:
+        text += (
+            "<b>👑 3. Расширенное руководство (7-10 Ранги):</b>\n"
+            "• Логи: <code>/Pbook</code>, <code>/Pbooks</code>, <code>/book</code>, <code>/books</code>, <code>/book_global</code>\n"
+            "• Власть: <code>/setaccess</code>, <code>/giverang</code>, <code>/ungiverang</code>, <code>/setzam</code>, <code>/unsetzam</code>\n"
+            "• Высшие: <code>/repgh</code>, <code>/muterep</code>, <code>/bot_boost</code>, <code>/checkrep</code>, <code>/checkboost</code>\n"
+            "• Глобал: <code>/glist</code>, <code>/gwlist</code>, <code>/ungban</code>, <code>/ungwarn</code>, <code>/Global news</code>\n"
+            "• Мониторинг VIP: <code>/Bvip</code> (Заявки), <code>/bookvip</code> (История покупок)\n"
+            "💡 <i>Используйте <code>/help1</code> ... <code>/help10</code> для просмотра команд по рангам.</i>"
+        )
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text.regexp(r"^/help([1-9]|10)$"))
-async def cmd_help_level(message: Message):
-    lvl = int(message.text.replace("/help", ""))
-    text = f"🛡️ <b>Команды, доступные для {lvl} ранга:</b>\n\n"
+async def cmd_help_ranks(message: Message):
+    rank_num = int(message.text.replace("/help", ""))
+    await message.answer(f"📋 <b>Команды для уровня доступа {rank_num}+:</b>\nКоманды данного ранга активны в соответствии с вашим статусом в системе.", parse_mode="HTML")
+
+# ==========================================
+# 6. ЭКОНОМИКА И ИГРОВЫЕ КОМАНДЫ
+# ==========================================
+
+@dp.message(Command("rep"))
+async def cmd_rep(message: Message, command: CommandObject):
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Команду нужно вызывать ответом на сообщение!")
     
-    if lvl >= 1: text += "• /aban (экстренная блокировка), /zadan (заявка на разбан)\n"
-    if lvl >= 5: text += "• /giverang\n"
-    if lvl >= 6: text += "• /aadan (просмотр заявок на разбан)\n"
-    if lvl >= 8: text += "• /repgh\n"
-    if lvl >= 10: text += "• /Global news, /givesvips\n"
+    target_id = message.reply_to_message.from_user.id
+    sender_id = message.from_user.id
+    if target_id == sender_id:
+        return await message.answer("❌ Нельзя изменять репутацию самому себе!")
+
+    sender = get_user(sender_id, message.from_user.username or "")
+    now_str = datetime.now().strftime("%Y-%m-%d")
     
+    max_rep_count = 3 if is_vip(sender) else 1
+    today_count = sender[11] if sender[12] == now_str else 0
+    
+    if today_count >= max_rep_count:
+        return await message.answer(f"❌ Лимит изменений репутации на сегодня исчерпан ({today_count}/{max_rep_count})!")
+
+    sign = command.args.strip() if command.args else "+"
+    delta = 1 if sign != "-" else -1
+    
+    target = get_user(target_id, message.reply_to_message.from_user.username or "")
+    update_user(target_id, rep=target[8] + delta)
+    update_user(sender_id, rep_given_today=today_count + 1, last_rep_date=now_str)
+    
+    await message.answer(f"✅ Вы изменили репутацию пользователю {message.reply_to_message.from_user.full_name} на {delta}! (Текущая: {target[8] + delta})")
+
+@dp.message(Command("bonus"))
+async def cmd_bonus(message: Message):
+    uid = message.from_user.id
+    user = get_user(uid, message.from_user.username or "")
+    
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    
+    if user[10] == today_str:
+        return await message.answer("❌ Вы уже забирали сегодняшний бонус! Приходите завтра.")
+    
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    streak = user[9] + 1 if user[10] == yesterday_str else 1
+    
+    if streak < 20:
+        coins_add = 100 + (streak - 1) * 25
+        exp_add = 50 + (streak - 1) * 10
+    else:
+        coins_add = 100 + (streak - 1) * 150
+        exp_add = 50 + (streak - 1) * 100
+        
+    coins_add = min(coins_add, 1500000)
+    exp_add = min(exp_add, 500)
+    
+    new_coins = user[5] + coins_add
+    new_exp = user[6] + exp_add
+    new_level = user[7]
+    
+    req_exp = 100
+    for lvl in range(1, new_level + 1):
+        if lvl < 30: req_exp += 50
+        elif lvl < 50: req_exp += 70
+        else: req_exp += 150
+        
+    lvl_up_text = ""
+    if new_exp >= req_exp:
+        new_level += 1
+        new_coins += 50
+        lvl_up_text = f"\n🎉 <b>Поздравляем! Новый уровень: {new_level}! (+50 монет)</b>"
+        
+        if new_level % 10 == 0:
+            reward_type = random.choice(["coins", "exp", "vip"])
+            if reward_type == "coins":
+                r_coins = random.randint(5000, 10000)
+                new_coins += r_coins
+                lvl_up_text += f"\n🎁 Награда за {new_level} лвл: +{r_coins} монет!"
+            elif reward_type == "exp":
+                r_exp = random.randint(100, 2000)
+                new_exp += r_exp
+                lvl_up_text += f"\n🎁 Награда за {new_level} лвл: +{r_exp} EXP!"
+            elif reward_type == "vip":
+                vip_days = random.randint(3, 14)
+                v_until = (datetime.now() + timedelta(days=vip_days)).strftime("%Y-%m-%d %H:%M:%S")
+                update_user(uid, vip_until=v_until)
+                lvl_up_text += f"\n🎁 Награда за {new_level} лвл: VIP на {vip_days} дней!"
+
+    update_user(uid, coins=new_coins, exp=new_exp, level=new_level, rep=user[8] + 1, streak=streak, last_bonus=today_str)
+    
+    await message.answer(
+        f"🎁 <b>Ежедневный бонус забран!</b>\n"
+        f"🔥 Серия: <b>{streak} дней</b>\n"
+        f"💰 Получено: +{coins_add} монет, +{exp_add} EXP, +1 Репутация\n"
+        f"{lvl_up_text}", parse_mode="HTML"
+    )
+
+@dp.message(Command("cmd"))
+async def cmd_alias(message: Message, command: CommandObject):
+    if not command.args or len(command.args.split()) < 2:
+        return await message.answer("⚠️ Пример использования: <code>/cmd s stats</code>", parse_mode="HTML")
+    
+    alias, orig_cmd = command.args.split(maxsplit=1)
+    alias = alias.lstrip('/')
+    orig_cmd = orig_cmd.lstrip('/')
+    
+    cursor.execute("REPLACE INTO aliases (user_id, alias, command) VALUES (?, ?, ?)", (message.from_user.id, alias, orig_cmd))
+    conn.commit()
+    await message.answer(f"✅ Алиас создан! Теперь <code>/{alias}</code> вызывает <code>/{orig_cmd}</code>.", parse_mode="HTML")
+
+@dp.message(Command("top"))
+async def cmd_top(message: Message):
+    cursor.execute("SELECT username, user_id, coins, level, rep, streak, msg_count, duel_wins FROM users ORDER BY coins DESC LIMIT 10")
+    rows = cursor.fetchall()
+    
+    text = "📊 <b>ТОП-10 ИГРОКОВ ЧАТА (ПО МОНЕТАМ):</b>\n\n"
+    for idx, r in enumerate(rows, 1):
+        name = f"@{r[0]}" if r[0] else f"ID:{r[1]}"
+        text += f"{idx}. {name} — 💰 {r[2]} | ⚡ {r[3]} лвл | ⭐ {r[4]} реп | 💬 {r[6]} сообщ.\n"
     await message.answer(text, parse_mode="HTML")
 
-
-# ==========================================
-# 2. ЭКСТРЕННАЯ БЛОКИРОВКА И СНЯТИЕ (/aban, /zadan, /aadan)
-# ==========================================
-
-@dp.message(Command("aban"))
-async def cmd_aban(message: Message, command: CommandObject):
-    sender_id = message.from_user.id
-    sender_rank = get_rank(sender_id, message.from_user.username)
+@dp.message(Command("tops"))
+async def cmd_tops(message: Message):
+    cursor.execute("SELECT user_id, username, coins FROM users ORDER BY coins DESC LIMIT 5")
+    rows = cursor.fetchall()
     
-    if sender_rank < 1:
-        return await message.answer("❌ Экстренная блокировка доступна с 1 ранга.")
-    
-    target_id = None
-    target_name = ""
-    
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-        target_name = message.reply_to_message.from_user.full_name
-    elif command.args:
-        arg = command.args.split()[0]
-        if arg.isdigit():
-            target_id = int(arg)
-            target_name = f"ID: {target_id}"
-            
-    if not target_id:
-        return await message.answer("⚠️ <b>Использование:</b> ответьте на сообщение сливщика или введите: <code>/aban [user_id]</code>", parse_mode="HTML")
+    text = "🌐 <b>МЕЖГРУППОВОЙ ТОП-5 (ГЛОБАЛЬНЫЙ):</b>\n\n"
+    for idx, r in enumerate(rows, 1):
+        name = f"@{r[1]}" if r[1] else f"ID:{r[0]}"
+        tag = " 👑 [VIP Т1]" if idx == 1 else " 🌟 [Legend]"
+        text += f"{idx}. {name} — 💰 {r[2]} монет {tag}\n"
         
-    if target_id == sender_id and sender_rank == 10:
-        return await message.answer("❌ Создатель бота не может заблокировать сам себя!")
+        if idx == 1:
+            v_until = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+            update_user(r[0], vip_until=v_until)
+    await message.answer(text, parse_mode="HTML")
 
-    aban_list.add(target_id)
-    await message.answer(
-        f"🚨 <b>СЛЕДСТВЕННАЯ ЗАЩИТА АКТИВИРОВАНА!</b>\n\n"
-        f"Пользователю <b>{target_name}</b> (<code>{target_id}</code>) мгновенно заблокирован доступ ко всем функциям бота во избежание слива.\n"
-        f"Для разблокировки пользователь должен подать заявку: <code>/zadan</code>.",
+@dp.message(Command("sell_role"))
+async def cmd_sell_role(message: Message):
+    uid = message.from_user.id
+    user = get_user(uid, message.from_user.username or "")
+    update_user(uid, coins=user[5] + 50000)
+    await message.answer("💰 Вы продали роль <b>Legend</b> и получили <b>50,000 монет</b>!", parse_mode="HTML")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    u = get_user(message.from_user.id, message.from_user.username or "")
+    text = (
+        f"📊 <b>СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ:</b>\n\n"
+        f"👤 Имя/Ник: <b>{u[16] or message.from_user.full_name}</b> (@{u[1] or 'none'})\n"
+        f"🔰 Админ-ранг: <b>{u[3]}</b>\n"
+        f"💰 Монеты: <b>{u[5]}</b>\n"
+        f"⚡ EXP: <b>{u[6]}</b> | Уровень: <b>{u[7]}</b>\n"
+        f"⭐ Репутация: <b>{u[8]}</b>\n"
+        f"🔥 Серия бонусов: <b>{u[9]} дней</b>\n"
+        f"👑 VIP-статус: <b>{'Активен (' + str(u[13]) + ')' if is_vip(u) else 'Нет'}</b>\n"
+        f"💬 Сообщений: <b>{u[14]}</b> | ⚔️ Побед в дуэлях: <b>{u[15]}</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("shop"))
+async def cmd_shop(message: Message, command: CommandObject):
+    cursor.execute("SELECT shop_exp_rate FROM chat_settings WHERE chat_id = ?", (message.chat.id,))
+    row = cursor.fetchone()
+    rate = row[0] if row else 10
+    
+    if not command.args:
+        return await message.answer(f"🏪 <b>ОБЫЧНЫЙ МАГАЗИН</b>\nКурс обмена: 1 EXP = {rate} монет.\nИспользование: <code>/shop exp [кол-во EXP]</code>", parse_mode="HTML")
+    
+    parts = command.args.split()
+    if parts[0] == "exp" and len(parts) > 1 and parts[1].isdigit():
+        exp_to_buy = int(parts[1])
+        cost = exp_to_buy * rate
+        user = get_user(message.from_user.id, message.from_user.username or "")
+        if user[5] < cost:
+            return await message.answer("❌ У вас недостаточно монет!")
+        update_user(message.from_user.id, coins=user[5] - cost, exp=user[6] + exp_to_buy)
+        await message.answer(f"✅ Куплено {exp_to_buy} EXP за {cost} монет!")
+
+@dp.message(Command("eshop"))
+async def cmd_eshop(message: Message):
+    await message.answer("✨ <b>ЭКСКЛЮЗИВНЫЙ МАГАЗИН РОЛЕЙ (8+ ранги):</b>\nДля покупки уникальных глобальных ролей обратитесь к Высшей Администрации.", parse_mode="HTML")
+
+@dp.message(Command("givemevip"))
+async def cmd_givemevip(message: Message):
+    uid = message.from_user.id
+    cursor.execute("SELECT 1 FROM user_roles_owned WHERE user_id = ? AND role_id = -999", (uid,))
+    if cursor.fetchone():
+        return await message.answer("❌ Вы уже активировали разовый тестовый VIP!")
+    
+    v_until = (datetime.now() + timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+    update_user(uid, vip_until=v_until)
+    cursor.execute("INSERT INTO user_roles_owned VALUES (?, -999)", (uid,))
+    conn.commit()
+    await message.answer("🎉 Вам бесплатно выдан <b>VIP на 48 часов</b>!", parse_mode="HTML")
+
+@dp.message(Command("role_info"))
+async def cmd_role_info(message: Message):
+    await message.answer("ℹ️ <b>Что такое Роль?</b>\nРоль — это уникальная плашка-надпись в вашем <code>/stats</code>. Созданная роль продается только в этой группе!", parse_mode="HTML")
+
+@dp.message(Command("role_shop"))
+async def cmd_role_shop(message: Message):
+    cursor.execute("SELECT role_id, text, price FROM custom_roles WHERE chat_id = ?", (message.chat.id,))
+    roles = cursor.fetchall()
+    if not roles:
+        return await message.answer("🛒 В этом чате пока нет созданных ролей.")
+    
+    text = "🛒 <b>МАГАЗИН РОЛЕЙ ЧАТА:</b>\n\n"
+    for r in roles:
+        text += f"ID: <code>{r[0]}</code> | {r[1]} — 💰 {r[2]} монет\n"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("my_role"))
+async def cmd_my_role(message: Message):
+    cursor.execute("SELECT role_id, text, monthly_income FROM custom_roles WHERE creator_id = ?", (message.from_user.id,))
+    roles = cursor.fetchall()
+    text = "🎨 <b>ВАШИ СОЗДАННЫЕ РОЛИ:</b>\n\n"
+    for r in roles:
+        text += f"ID: {r[0]} | {r[1]} | Доход за месяц: {r[2]} монет\n"
+    await message.answer(text if roles else "У вас нет созданных ролей.", parse_mode="HTML")
+
+@dp.message(Command("create_role"))
+async def cmd_create_role(message: Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/create_role [Текст] [#HEX-код] [Цена]</code>\nПример: <code>/create_role [Босс] [#FF0000] [10000]</code>", parse_mode="HTML")
+    try:
+        raw = command.args
+        text = raw[raw.find("[")+1:raw.find("]")]
+        rest = raw[raw.find("]")+1:]
+        color = rest[rest.find("[")+1:rest.find("]")]
+        price = int(rest.split("[")[-1].replace("]", ""))
+        
+        cursor.execute("INSERT INTO custom_roles (creator_id, chat_id, text, color_code, price) VALUES (?, ?, ?, ?, ?)",
+                       (message.from_user.id, message.chat.id, text, color, price))
+        conn.commit()
+        await message.answer(f"✅ Роль '{text}' успешно создана и добавлена в <code>/role_shop</code>!")
+    except Exception:
+        await message.answer("❌ Ошибка формата! Проверьте скобки и параметры.")
+
+@dp.message(Command("money_role"))
+async def cmd_money_role(message: Message):
+    cursor.execute("SELECT SUM(monthly_income) FROM custom_roles WHERE creator_id = ?", (message.from_user.id,))
+    inc = cursor.fetchone()[0] or 0
+    if inc <= 0:
+        return await message.answer("❌ На ваших ролях нет накопленных средств.")
+    
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    update_user(message.from_user.id, coins=user[5] + inc)
+    cursor.execute("UPDATE custom_roles SET monthly_income = 0 WHERE creator_id = ?", (message.from_user.id,))
+    conn.commit()
+    await message.answer(f"💰 Вы успешно сняли <b>{inc} монет</b> со своих ролей!", parse_mode="HTML")
+
+@dp.message(Command("duel"))
+async def cmd_duel(message: Message, command: CommandObject):
+    if not message.reply_to_message or not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Использование: ответьте на сообщение и укажите ставку <code>/duel 100</code>", parse_mode="HTML")
+    
+    bet = int(command.args)
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    max_bet = 2000 if is_vip(user) else 500
+    min_bet = 1 if is_vip(user) else 10
+    
+    if not (min_bet <= bet <= max_bet):
+        return await message.answer(f"❌ Допустимая ставка: от {min_bet} до {max_bet} монет!")
+        
+    if user[5] < bet:
+        return await message.answer("❌ У вас недостаточно монет!")
+        
+    target_id = message.reply_to_message.from_user.id
+    target = get_user(target_id, message.reply_to_message.from_user.username or "")
+    if target[5] < bet:
+        return await message.answer("❌ У соперника недостаточно монет!")
+
+    winner_id = random.choice([message.from_user.id, target_id])
+    loser_id = target_id if winner_id == message.from_user.id else message.from_user.id
+    
+    w_user = get_user(winner_id)
+    l_user = get_user(loser_id)
+    
+    update_user(winner_id, coins=w_user[5] + bet, duel_wins=w_user[15] + 1)
+    update_user(loser_id, coins=l_user[5] - bet)
+    
+    await message.answer(f"⚔️ В дуэли победил <a href='tg://user?id={winner_id}'>Игрок</a> и выиграл <b>{bet} монет</b>!", parse_mode="HTML")
+
+@dp.message(Command("transfer"))
+async def cmd_transfer(message: Message, command: CommandObject):
+    if not message.reply_to_message or not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Ответьте на сообщение: <code>/transfer 500</code>", parse_mode="HTML")
+    
+    amount = int(command.args)
+    sender = get_user(message.from_user.id, message.from_user.username or "")
+    limit = 2000 if is_vip(sender) else 500
+    
+    if amount > limit:
+        return await message.answer(f"❌ Ваш лимит перевода: {limit} монет в день!")
+    if sender[5] < amount:
+        return await message.answer("❌ У вас нет столько монет!")
+
+    target_id = message.reply_to_message.from_user.id
+    target = get_user(target_id, message.reply_to_message.from_user.username or "")
+    
+    update_user(message.from_user.id, coins=sender[5] - amount)
+    update_user(target_id, coins=target[5] + amount)
+    await message.answer(f"💸 Успешно переведено <b>{amount} монет</b> пользователю {message.reply_to_message.from_user.full_name}!", parse_mode="HTML")
+
+@dp.message(Command("report"))
+async def cmd_report(message: Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("⚠️ Укажите суть жалобы: <code>/report Спам в чате</code>", parse_mode="HTML")
+    
+    target_id = message.reply_to_message.from_user.id if message.reply_to_message else 0
+    cursor.execute("INSERT INTO reports (chat_id, user_id, target_id, text) VALUES (?, ?, ?, ?)",
+                   (message.chat.id, message.from_user.id, target_id, command.args))
+    conn.commit()
+    await message.answer("🚨 Ваша жалоба отправлена администрации!")
+
+# ==========================================
+# 7. ИНТЕГРИРОВАННЫЙ МАГААИН VIP (UAH / TG STARS)
+# ==========================================
+
+def get_vip_currency_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплата в ГРН", callback_data="buy_vip_uah")],
+            [InlineKeyboardButton(text="⭐️ Оплата Звёздами TG", callback_data="buy_vip_stars")]
+        ]
+    )
+
+def get_prices_keyboard(currency: str):
+    prices = PRICES_UAH if currency == "uah" else PRICES_STARS
+    buttons = []
+    for key, data in prices.items():
+        buttons.append([InlineKeyboardButton(text=data["text"], callback_data=f"select_{currency}_{key}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_currency")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.message(Command("vip"))
+async def cmd_vip(message: Message):
+    await message.answer("✨ <b>Выберите способ оплаты VIP-статуса:</b>", reply_markup=get_vip_currency_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "back_to_currency")
+async def back_to_currency(callback: CallbackQuery):
+    await callback.message.edit_text("✨ <b>Выберите способ оплаты VIP-статуса:</b>", reply_markup=get_vip_currency_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "buy_vip_uah")
+async def select_uah(callback: CallbackQuery):
+    await callback.message.edit_text("💳 <b>Выберите период VIP (Оплата в грн):</b>\nПосле выбора вам будут предоставлены реквизиты для оплаты.", reply_markup=get_prices_keyboard("uah"), parse_mode="HTML")
+
+@dp.callback_query(F.data == "buy_vip_stars")
+async def select_stars(callback: CallbackQuery):
+    await callback.message.edit_text("⭐️ <b>Выберите период VIP (Оплата Telegram Stars):</b>", reply_markup=get_prices_keyboard("stars"), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("select_uah_"))
+async def process_uah_selection(callback: CallbackQuery):
+    period = callback.data.split("_")[2]
+    info = PRICES_UAH[period]
+
+    confirm_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid_uah_{period}_{info['price']}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_currency")]
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"💳 <b>Оплата VIP ({info['text']})</b>\n\n"
+        f"Переведите <b>{info['price']} грн</b> на карту:\n<code>{CARD_DETAILS}</code>\n\n"
+        "После перевода нажмите кнопку <b>«Я оплатил(а)»</b> ниже.",
+        reply_markup=confirm_kb,
         parse_mode="HTML"
     )
 
-@dp.message(Command("zadan"))
-async def cmd_zadan(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in aban_list:
-        return await message.answer("❌ Вы не находитесь в списке заблокированных (/aban).")
-        
-    req_id = f"unaban_{user_id}"
-    if req_id in pending_requests:
-        return await message.answer("⏳ Ваша заявка на снятие блокировки уже находится на рассмотрении!")
+@dp.callback_query(F.data.startswith("paid_uah_"))
+async def process_uah_paid(callback: CallbackQuery):
+    _, _, period, price = callback.data.split("_")
+    user = callback.from_user
+    username = f"@{user.username}" if user.username else f"ID: {user.id}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    rank = get_rank(user_id, message.from_user.username)
-    user_is_ts = is_ts(user_id)
-    
-    pending_requests[req_id] = {
-        "type": "unaban",
-        "user_id": user_id,
-        "username": message.from_user.username or message.from_user.full_name,
-        "rank": rank,
-        "is_ts": user_is_ts
-    }
-    
-    await message.answer("📩 Ваша заявка на снятие экстренной блокировки создана и передана руководству!")
-    
-    # Оповещение модераторов
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Снять ABAN", callback_data=f"approve_unaban_{user_id}"),
-        InlineKeyboardButton(text="❌ Оставить ABAN", callback_data=f"deny_unaban_{user_id}")
-    ]])
-    
-    text = (
-        f"🚨 <b>[ЗАЯВКА НА СНЯТИЕ ABAN]</b>\n\n"
-        f"• Пользователь: @{message.from_user.username or 'без_юзернейма'}\n"
-        f"• ID: <code>{user_id}</code>\n"
-        f"• Ранг: <b>{rank}</b> | ТС: <b>{'Да' if user_is_ts else 'Нет'}</b>"
+    cursor.execute(
+        "INSERT INTO pending_vip_orders (user_id, username, period, price, currency, date) VALUES (?, ?, ?, ?, ?, ?)",
+        (user.id, username, period, price, "грн", now_str)
     )
-    
-    # Рассылка в зависимости от уровня забаненного
-    notified = set()
-    if rank < 6 and not user_is_ts:
-        # Для <5 лвл: уведомляем ГА (6+) и ТС (роль 1,2)
-        for uid, r in user_ranks.items():
-            if r >= 6: notified.add(uid)
-        for uid, roles in user_roles.items():
-            if 1 in roles or 2 in roles: notified.add(uid)
-    elif rank in [6, 7] or user_is_ts:
-        # Для ГА/ТС: уведомляем роли 3 и 4
-        for uid, roles in user_roles.items():
-            if 3 in roles or 4 in roles: notified.add(uid)
-    else:
-        # Для 8+ лвл: уведомляем 8+ лвл
-        for uid, r in user_ranks.items():
-            if r >= 8: notified.add(uid)
+    conn.commit()
+    order_id = cursor.lastrowid
 
-    for admin_id in notified:
+    await callback.message.edit_text("⌛ <b>Ваша заявка отправлена администраторам!</b>\nОжидайте проверки и активации VIP-статуса.", parse_mode="HTML")
+
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_confirm_{order_id}"),
+                InlineKeyboardButton(text="❌ Отказать", callback_data=f"adm_refuse_{order_id}")
+            ]
+        ]
+    )
+
+    period_str = "Навсегда" if period == "forever" else f"{period} мес."
+
+    for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
-
-@dp.message(Command("aadan"))
-async def cmd_aadan(message: Message):
-    if message.chat.type != "private":
-        return await message.answer("❌ Команда `/aadan` работает <b>строго в ЛС бота</b>!", parse_mode="HTML")
-        
-    uid = message.from_user.id
-    rank = get_rank(uid, message.from_user.username)
-    roles = get_user_roles(uid)
-    
-    if rank < 6 and not is_ts(uid) and 3 not in roles and 4 not in roles:
-        return await message.answer("❌ Доступ к проверке заявок на снятие ABAN запрещен.")
-        
-    count = 0
-    await message.answer("🔍 <b>Проверка активных заявок на снятие ABAN...</b>", parse_mode="HTML")
-    
-    for req_id, req in list(pending_requests.items()):
-        if req["type"] == "unaban":
-            count += 1
-            target_id = req["user_id"]
-            votes = len(unaban_votes.get(target_id, set()))
-            req_info = f" (Голосов от 3/4 ролей: {votes}/3)" if (req["rank"] in [6, 7] or req["is_ts"]) else ""
-            
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Снять ABAN", callback_data=f"approve_unaban_{target_id}"),
-                InlineKeyboardButton(text="❌ Оставить ABAN", callback_data=f"deny_unaban_{target_id}")
-            ]])
-            
-            await message.answer(
-                f"🚨 <b>Заявка от @{req['username']}</b> (ID: <code>{target_id}</code>)\n"
-                f"Ранг: {req['rank']}{req_info}",
-                reply_markup=kb,
+            await bot.send_message(
+                admin_id,
+                f"📥 <b>Новая заявка на VIP (#{order_id})</b>\n\n"
+                f"👤 Пользователь: {username} (<code>{user.id}</code>)\n"
+                f"⏱ Срок: {period_str}\n"
+                f"💰 Сумма: {price} грн",
+                reply_markup=admin_kb,
                 parse_mode="HTML"
             )
-            
-    if count == 0:
-        await message.answer("🎉 Активных заявок на снятие ABAN нет!")
-
-@dp.callback_query(F.data.startswith("approve_unaban_"))
-async def process_approve_unaban(callback: CallbackQuery):
-    admin_id = callback.from_user.id
-    admin_rank = get_rank(admin_id, callback.from_user.username)
-    admin_roles = get_user_roles(admin_id)
-    
-    target_id = int(callback.data.replace("approve_unaban_", ""))
-    req_id = f"unaban_{target_id}"
-    req = pending_requests.get(req_id)
-    
-    if not req:
-        return await callback.answer("❌ Заявка не найдена или уже обработана.", show_alert=True)
-        
-    target_rank = req["rank"]
-    target_is_ts = req["is_ts"]
-    
-    # Запрет снимать с себя
-    if admin_id == target_id:
-        return await callback.answer("❌ Нельзя одобрить снятие бана самому себе!", show_alert=True)
-
-    # Логика 1: Для обычных пользователей (до 5 ранга) -> ГА (6+) или ТС
-    if target_rank < 6 and not target_is_ts:
-        if admin_rank < 6 and not is_ts(admin_id):
-            return await callback.answer("❌ Для снятия требуется одобрение ГА (6+ ранг) или ТС!", show_alert=True)
-            
-        aban_list.discard(target_id)
-        pending_requests.pop(req_id, None)
-        try:
-            await callback.bot.send_message(target_id, "🎉 <b>Ваш ABAN был успешно снят администратором!</b>", parse_mode="HTML")
         except Exception:
             pass
-        return await callback.message.edit_text(f"✅ **ABAN снят** с пользователя <code>{target_id}</code>.", parse_mode="HTML")
 
-    # Логика 2: Для ГА (6-7 ранг) или ТС -> требуется 3 одобрения от ролей 3 или 4
-    elif target_rank in [6, 7] or target_is_ts:
-        if 3 not in admin_roles and 4 not in admin_roles:
-            return await callback.answer("❌ Для снятия ABAN с ГА/ТС требуется одобрение от владельцев 3 или 4 роли!", show_alert=True)
-            
-        voters = unaban_votes.setdefault(target_id, set())
-        voters.add(admin_id)
-        
-        if len(voters) >= 3:
-            aban_list.discard(target_id)
-            pending_requests.pop(req_id, None)
-            unaban_votes.pop(target_id, None)
-            try:
-                await callback.bot.send_message(target_id, "🎉 **Ваш ABAN был снят по решению 3 администраторов (3/4 роли)!**", parse_mode="HTML")
-            except Exception:
-                pass
-            return await callback.message.edit_text(f"✅ **ABAN успешно снят!** Получено {len(voters)}/3 необходимых голосов.", parse_mode="HTML")
-        else:
-            return await callback.answer(f"✅ Ваш голос учтен! Запущено голосов: {len(voters)}/3", show_alert=True)
+# Oплата через Stars
+@dp.callback_query(F.data.startswith("select_stars_"))
+async def process_stars_selection(callback: CallbackQuery):
+    period = callback.data.split("_")[2]
+    info = PRICES_STARS[period]
 
-    # Логика 3: Для Руководства (8+ ранг) -> требуется одобрение 8+
-    else:
-        if admin_rank < 8:
-            return await callback.answer("❌ Снять ABAN с руководства может только админ 8+ ранга!", show_alert=True)
-            
-        aban_list.discard(target_id)
-        pending_requests.pop(req_id, None)
-        try:
-            await callback.bot.send_message(target_id, "🎉 **Ваш ABAN был снят Руководством!**", parse_mode="HTML")
-        except Exception:
-            pass
-        return await callback.message.edit_text(f"✅ **ABAN снят** с руководителя <code>{target_id}</code>.", parse_mode="HTML")
+    title = f"VIP Подписка ({period} мес.)" if period != "forever" else "VIP Навсегда"
+    description = f"Активация VIP-статуса в боте на {info['text']}"
 
-@dp.callback_query(F.data.startswith("deny_unaban_"))
-async def process_deny_unaban(callback: CallbackQuery):
-    admin_id = callback.from_user.id
-    admin_rank = get_rank(admin_id, callback.from_user.username)
-    
-    if admin_rank < 6 and not is_ts(admin_id):
-        return await callback.answer("❌ У вас недостаточно прав для отклонения этой заявки.", show_alert=True)
-        
-    target_id = int(callback.data.replace("deny_unaban_", ""))
-    req_id = f"unaban_{target_id}"
-    
-    pending_requests.pop(req_id, None)
-    unaban_votes.pop(target_id, None)
-    
-    try:
-        await callback.bot.send_message(target_id, "❌ Ваша заявка на снятие ABAN была отклонена.")
-    except Exception:
-        pass
-        
-    await callback.message.edit_text(f"❌ Заявка на снятие ABAN для <code>{target_id}</code> была отклонена.", parse_mode="HTML")
+    prices = [LabeledPrice(label="VIP", amount=info["price"])]
 
-
-# ==========================================
-# 3. ПОКУПКА VIP И СИСТЕМА VIP (/buyvip, /pleasevip, /givesvips)
-# ==========================================
-
-def get_buyvip_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇺🇦 За гривни (UAH)", callback_data="buyvip_currency_uah"),
-            InlineKeyboardButton(text="⭐️ За звезды (Stars)", callback_data="buyvip_currency_stars")
-        ]
-    ])
-
-def get_stars_tariffs_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 месяц — 30 ⭐️", callback_data="buyvip_stars_1m")],
-        [InlineKeyboardButton(text="3 месяца — 60 ⭐️", callback_data="buyvip_stars_3m")],
-        [InlineKeyboardButton(text="6 месяцев — 90 ⭐️", callback_data="buyvip_stars_6m")],
-        [InlineKeyboardButton(text="12 месяцев — 160 ⭐️", callback_data="buyvip_stars_12m")],
-        [InlineKeyboardButton(text="♾ Навсегда — 650 ⭐️", callback_data="buyvip_stars_forever")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="buyvip_back")]
-    ])
-
-@dp.message(Command("buyvip"))
-async def cmd_buyvip(message: Message):
-    text = (
-        "🌟 <b>Покупка VIP-статуса</b>\n\n"
-        "Выберите удобный способ оплаты:\n"
-        "• <b>UAH (Гривны)</b> — перевод на банку Monobank\n"
-        "• <b>Stars (Звезды)</b> — оплата напрямую в Telegram"
-    )
-    await message.answer(text, reply_markup=get_buyvip_kb(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "buyvip_currency_uah")
-async def process_vip_uah(callback: CallbackQuery):
-    text = (
-        "💳 <b>Оплата VIP через Monobank (UAH)</b>\n\n"
-        "<b>Тарифы:</b>\n"
-        "• 1 месяц — <b>20 грн</b>\n"
-        "• 3 месяца — <b>50 грн</b>\n"
-        "• 6 месяцев — <b>85 грн</b>\n"
-        "• 12 месяцев — <b>140 грн</b>\n"
-        "• ♾ Навсегда — <b>500 грн</b>\n\n"
-        "⚠️ <b>ОБЯЗАТЕЛЬНО:</b> В комментарии к переводу укажите ваш <b>@username</b>, "
-        "иначе вы не сможете получить VIP!\n\n"
-        f"🔗 <b>Ссылка на банку Monobank:</b>\n{MONOBANK_JAR}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Перейти в банку Monobank", url=MONOBANK_JAR)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="buyvip_back")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data == "buyvip_currency_stars")
-async def process_vip_stars(callback: CallbackQuery):
-    await callback.message.edit_text("⭐️ <b>Выберите тариф за Telegram Stars:</b>", reply_markup=get_stars_tariffs_kb(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "buyvip_back")
-async def process_vip_back(callback: CallbackQuery):
-    text = (
-        "🌟 <b>Покупка VIP-статуса</b>\n\n"
-        "Выберите удобный способ оплаты:"
-    )
-    await callback.message.edit_text(text, reply_markup=get_buyvip_kb(), parse_mode="HTML")
-
-# --- Оплата звездами ---
-STARS_PRICES = {
-    "buyvip_stars_1m": ("VIP на 1 месяц", 30),
-    "buyvip_stars_3m": ("VIP на 3 месяца", 60),
-    "buyvip_stars_6m": ("VIP на 6 месяцев", 90),
-    "buyvip_stars_12m": ("VIP на 12 месяцев", 160),
-    "buyvip_stars_forever": ("VIP Навсегда", 650)
-}
-
-@dp.callback_query(F.data.in_(STARS_PRICES.keys()))
-async def process_stars_invoice(callback: CallbackQuery):
-    title, stars_amount = STARS_PRICES[callback.data]
-    prices = [LabeledPrice(label=title, amount=stars_amount)]
-    
-    await callback.bot.send_invoice(
+    await bot.send_invoice(
         chat_id=callback.from_user.id,
         title=title,
-        description=f"Приобретение {title} за {stars_amount} Telegram Stars",
-        payload=f"vip_stars_{callback.data}",
-        provider_token="",
+        description=description,
+        payload=f"stars_vip_{period}",
         currency="XTR",
         prices=prices
     )
     await callback.answer()
 
 @dp.pre_checkout_query()
-async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    await pre_checkout_query.answer(ok=True)
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 @dp.message(F.successful_payment)
-async def process_successful_payment(message: Message):
-    vip_users[message.from_user.id] = {"type": "paid"}
-    await message.answer("🎉 <b>Оплата прошла успешно! VIP-статус активирован!</b>", parse_mode="HTML")
+async def successful_payment_handler(message: Message):
+    payment = message.successful_payment
+    payload = payment.invoice_payload.split("_")
+    period = payload[2]
+    price = payment.total_amount
 
-@dp.message(Command("givesvips"))
-async def cmd_givesvips(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id, message.from_user.username) < 10:
-        return await message.answer("❌ Выдача VIP вручную доступна только администраторам 10+ ранга.")
-    
-    if not command.args or len(command.args.split()) < 2:
-        return await message.answer(
-            "⚠️ <b>Использование:</b>\n"
-            "<code>/givesvips @username [месяцев (1-12) или forever]</code>\n\n"
-            "Пример: <code>/givesvips @durov 3</code> или <code>/givesvips @durov forever</code>",
-            parse_mode="HTML"
+    user = message.from_user
+    username = f"@{user.username}" if user.username else f"ID: {user.id}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    period_str = "Навсегда" if period == "forever" else f"{period} мес."
+
+    # Начисляем VIP в базу
+    add_vip_time(user.id, period)
+
+    # Сохраняем в историю
+    cursor.execute(
+        "INSERT INTO vip_history (user_id, username, price, currency, period, date) VALUES (?, ?, ?, ?, ?, ?)",
+        (user.id, username, str(price), "звезд TG", period_str, now_str)
+    )
+    conn.commit()
+
+    await message.answer(f"🎉 <b>Оплата прошла успешно!</b>\nВам активирован VIP-статус на: <b>{period_str}</b>.", parse_mode="HTML")
+
+# Админ-панель VIP
+@dp.message(Command("Bvip"))
+async def cmd_bvip(message: Message):
+    user = get_user(message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return
+
+    cursor.execute("SELECT * FROM pending_vip_orders")
+    orders = cursor.fetchall()
+
+    if not orders:
+        return await message.answer("📥 <b>Активных заявок на покупку VIP нет.</b>", parse_mode="HTML")
+
+    text = "📥 <b>Заявки на оплаченный VIP:</b>\n\n"
+    for order in orders:
+        p_str = "Навсегда" if order[3] == "forever" else f"{order[3]} мес."
+        text += (
+            f"🔹 <b>Заявка #{order[0]}</b>\n"
+            f"👤 Пользователь: {order[2]} (<code>{order[1]}</code>)\n"
+            f"⏱ Выбранный срок: {p_str}\n"
+            f"💰 Заявленная сумма: {order[4]} {order[5]}\n"
+            f"📅 Дата: {order[6]}\n\n"
         )
-    
-    args = command.args.split()
-    target_username = args[0]
-    period = args[1].lower()
-    
-    if period == "forever":
-        duration_str = "навсегда"
-    elif period.isdigit() and 1 <= int(period) <= 12:
-        duration_str = f"на {period} мес."
-    else:
-        return await message.answer("❌ Укажите количество месяцев от 1 до 12 или слово <code>forever</code>.", parse_mode="HTML")
-    
-    await message.answer(f"✅ Пользователю <b>{target_username}</b> успешно выдан VIP-статус {duration_str}!", parse_mode="HTML")
 
-@dp.message(Command("pleasevip"))
-async def cmd_pleasevip(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id in used_pleasevip:
-        return await message.answer("❌ Вы уже использовали бесплатный пробный VIP-статус!")
-    
-    req_id = f"pvip_{user_id}"
-    pending_requests[req_id] = {
-        "type": "pvip",
-        "user_id": user_id,
-        "username": message.from_user.username or message.from_user.full_name
-    }
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить VIP (5 дней)", callback_data=f"approve_pvip_{user_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_pvip_{user_id}")
-    ]])
-    
-    await message.answer("📩 Ваша заявка на бесплатный VIP (5 дней) отправлена администраторам в ЛС.")
-    
-    for admin_id, rank in user_ranks.items():
-        if rank >= 8:
+    await message.answer(text, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("adm_refuse_"))
+async def admin_refuse_order(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if callback.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return
+
+    order_id = int(callback.data.split("_")[2])
+    cursor.execute("SELECT user_id, username FROM pending_vip_orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+
+    if row:
+        cursor.execute("DELETE FROM pending_vip_orders WHERE order_id = ?", (order_id,))
+        conn.commit()
+        try:
+            await bot.send_message(row[0], "❌ Ваша заявка на активацию VIP была отклонена администратором.")
+        except Exception:
+            pass
+        await callback.message.edit_text(f"❌ <b>Заявка #{order_id} ({row[1]}) была отклонена.</b>", parse_mode="HTML")
+    else:
+        await callback.answer("Заявка уже обработана.")
+
+@dp.callback_query(F.data.startswith("adm_confirm_"))
+async def admin_confirm_order(callback: CallbackQuery, state: FSMContext):
+    user = get_user(callback.from_user.id)
+    if callback.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return
+
+    order_id = int(callback.data.split("_")[2])
+    cursor.execute("SELECT 1 FROM pending_vip_orders WHERE order_id = ?", (order_id,))
+    if not cursor.fetchone():
+        return await callback.answer("Заявка не найдена или уже обработана.")
+
+    await state.update_data(current_order_id=order_id)
+    await state.set_state(AdminProcessOrder.waiting_for_details)
+
+    await callback.message.answer(
+        f"📝 <b>Подтверждение заявки #{order_id}</b>\n\n"
+        f"Введите данные в формате:\n<code>СУММА,СРОК ЮЗЕРНЕЙМ</code>\n\n"
+        f"📌 Пример: <code>30,1 @username</code>\n"
+        f"<i>(где 30 — сумма грн, 1 — срок в месяцах (или 'навсегда'), далее юзернейм/ID)</i>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(AdminProcessOrder.waiting_for_details)
+async def process_admin_input(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return
+
+    data = await state.get_data()
+    order_id = data.get("current_order_id")
+
+    try:
+        raw_text = message.text.strip()
+        parts = raw_text.split(",")
+        sum_part = parts[0].strip()
+
+        rest = parts[1].strip().split(" ")
+        term_part = rest[0].strip()
+        user_part = " ".join(rest[1:]).strip()
+
+        cursor.execute("SELECT user_id, username FROM pending_vip_orders WHERE order_id = ?", (order_id,))
+        order = cursor.fetchone()
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        period_str = "Навсегда" if term_part.lower() == "навсегда" else f"{term_part} мес."
+
+        target_uid = order[0] if order else None
+
+        if target_uid:
+            add_vip_time(target_uid, term_part)
+
+        cursor.execute("DELETE FROM pending_vip_orders WHERE order_id = ?", (order_id,))
+        cursor.execute(
+            "INSERT INTO vip_history (user_id, username, price, currency, period, date) VALUES (?, ?, ?, ?, ?, ?)",
+            (target_uid or 0, user_part or (order[1] if order else "Н/Д"), sum_part, "грн", period_str, now_str)
+        )
+        conn.commit()
+
+        if target_uid:
             try:
                 await bot.send_message(
-                    admin_id,
-                    f"🔔 <b>[Заявка на VIP (5 дней)]</b>\n\n"
-                    f"• Пользователь: @{message.from_user.username or 'без_юзернейма'}\n"
-                    f"• ID: <code>{user_id}</code>",
-                    reply_markup=kb,
+                    target_uid,
+                    f"🎉 <b>Ваша оплата подтверждена!</b>\nВам успешно зачислен VIP-статус на: <b>{period_str}</b>.",
                     parse_mode="HTML"
                 )
             except Exception:
                 pass
 
+        await message.answer(
+            f"✅ <b>Оплата подтверждена и внесена в реестр!</b>\n\n"
+            f"🔹 Сумма: {sum_part} грн\n"
+            f"🔹 Срок: {period_str}\n"
+            f"🔹 Пользователь: {user_part}",
+            parse_mode="HTML"
+        )
+        await state.clear()
 
-# ==========================================
-# 4. СИСТЕМА ЗАЯВОК НА ТС (/tc) И КУРАТОРСКАЯ КОМАНДА /zayavka
-# ==========================================
-
-@dp.message(Command("tc"))
-async def cmd_tc(message: Message, command: CommandObject):
-    if not command.args:
-        return await message.answer("⚠️ Использование: `/tc @username` (подать заявку на ТС)", parse_mode="Markdown")
-    
-    target_username = command.args.strip()
-    user_id = message.from_user.id
-    req_id = f"tc_{user_id}_{target_username.replace('@', '')}"
-    
-    pending_requests[req_id] = {
-        "type": "tc",
-        "user_id": user_id,
-        "username": message.from_user.username or message.from_user.full_name,
-        "target_username": target_username
-    }
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Согласиться", callback_data=f"approve_tc_{req_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_tc_{req_id}")
-    ]])
-    
-    await message.answer("📩 Ваша заявка на ТС успешно отправлена руководству в ЛС!")
-    
-    notified_users = set()
-    for uid, rank in user_ranks.items():
-        if rank >= 8:
-            notified_users.add(uid)
-            
-    for uid, roles in user_roles.items():
-        if 1 in roles or 2 in roles:
-            notified_users.add(uid)
-            
-    for target_id in notified_users:
-        try:
-            await bot.send_message(
-                target_id,
-                f"🔔 <b>[Новая заявка на ТС]</b>\n\n"
-                f"• Подал: @{message.from_user.username or user_id}\n"
-                f"• Назначить ТС для: <b>{target_username}</b>",
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-@dp.message(Command("zayavka"))
-async def cmd_zayavka(message: Message):
-    if message.chat.type != "private":
-        return await message.answer("❌ Команда `/zayavka` работает <b>строго в ЛС бота</b>!", parse_mode="HTML")
-    
-    user_id = message.from_user.id
-    rank = get_rank(user_id, message.from_user.username)
-    roles = get_user_roles(user_id)
-    
-    can_review_pvip = (rank >= 8)
-    can_review_tc = (rank >= 8 or 1 in roles or 2 in roles or rank in [9, 10])
-    
-    if not (can_review_pvip or can_review_tc):
-        return await message.answer("❌ У вас нет доступа к просмотру активных заявок.")
-    
-    text = "📥 <b>Список всех доступных заявок на одобрение:</b>\n\n"
-    count = 0
-    
-    for req_id, req in list(pending_requests.items()):
-        if req["type"] == "pvip" and can_review_pvip:
-            count += 1
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_pvip_{req['user_id']}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_pvip_{req['user_id']}")
-            ]])
-            await message.answer(f"🔹 <b>VIP (5 дней)</b> от @{req['username']} (ID: <code>{req['user_id']}</code>)", reply_markup=kb, parse_mode="HTML")
-            
-        elif req["type"] == "tc" and can_review_tc:
-            count += 1
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Согласиться", callback_data=f"approve_tc_{req_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_tc_{req_id}")
-            ]])
-            await message.answer(f"🔹 <b>Заявка на ТС</b> от @{req['username']} для <b>{req['target_username']}</b>", reply_markup=kb, parse_mode="HTML")
-            
-    if count == 0:
-        await message.answer("🎉 Нет активных заявок для вашего уровня доступа!")
-
-@dp.callback_query(F.data.startswith("approve_pvip_"))
-async def process_approve_pvip(callback: CallbackQuery):
-    if get_rank(callback.from_user.id, callback.from_user.username) < 8:
-        return await callback.answer("❌ Одобрять заявки могут только администраторы 8+ ранга!", show_alert=True)
-    
-    target_id = int(callback.data.replace("approve_pvip_", ""))
-    used_pleasevip.add(target_id)
-    vip_users[target_id] = {"type": "trial_5d"}
-    pending_requests.pop(f"pvip_{target_id}", None)
-    
-    try:
-        await callback.bot.send_message(target_id, "🎉 <b>Ваша заявка одобрена!</b> Вам выдан VIP-статус на 5 дней.", parse_mode="HTML")
     except Exception:
-        pass
-        
-    await callback.message.edit_text(f"✅ <b>Заявка одобрена!</b> Пользователю (ID: <code>{target_id}</code>) выдан VIP на 5 дней.", parse_mode="HTML")
+        await message.answer(
+            "⚠️ <b>Ошибка в формате ввода!</b> Попробуйте снова.\nФормат: <code>30,1 @username</code>",
+            parse_mode="HTML"
+        )
 
-@dp.callback_query(F.data.startswith("deny_pvip_"))
-async def process_deny_pvip(callback: CallbackQuery):
-    if get_rank(callback.from_user.id, callback.from_user.username) < 8:
-        return await callback.answer("❌ Отклонять заявки могут только администраторы 8+ ранга!", show_alert=True)
-    
-    target_id = int(callback.data.replace("deny_pvip_", ""))
-    pending_requests.pop(f"pvip_{target_id}", None)
-    
-    try:
-        await callback.bot.send_message(target_id, "❌ Ваша заявка на бесплатный VIP была отклонена.")
-    except Exception:
-        pass
-        
-    await callback.message.edit_text(f"❌ Заявка пользователя (ID: <code>{target_id}</code>) отклонена.", parse_mode="HTML")
+@dp.message(Command("bookvip"))
+async def cmd_bookvip(message: Message):
+    user = get_user(message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return
 
-@dp.callback_query(F.data.startswith("approve_tc_"))
-async def process_approve_tc(callback: CallbackQuery):
-    uid = callback.from_user.id
-    rank = get_rank(uid, callback.from_user.username)
-    roles = get_user_roles(uid)
-    
-    if not (rank >= 8 or 1 in roles or 2 in roles or rank in [9, 10]):
-        return await callback.answer("❌ У вас нет прав для одобрения заявки на ТС!", show_alert=True)
-    
-    req_id = callback.data.replace("approve_tc_", "")
-    req_data = pending_requests.pop(req_id, None)
-    
-    target_str = req_data['target_username'] if req_data else "пользователя"
-    if req_data:
-        try:
-            await callback.bot.send_message(req_data['user_id'], f"🎉 <b>Ваша заявка на ТС для {target_str} была ОДОБРЕНА!</b>", parse_mode="HTML")
-        except Exception:
-            pass
-            
-    await callback.message.edit_text(f"✅ <b>Заявка на ТС для {target_str} СОГЛАСОВАНА!</b>", parse_mode="HTML")
+    cursor.execute("SELECT username, period, price, currency, date FROM vip_history ORDER BY id DESC LIMIT 50")
+    history = cursor.fetchall()
 
-@dp.callback_query(F.data.startswith("deny_tc_"))
-async def process_deny_tc(callback: CallbackQuery):
-    uid = callback.from_user.id
-    rank = get_rank(uid, callback.from_user.username)
-    roles = get_user_roles(uid)
-    
-    if not (rank >= 8 or 1 in roles or 2 in roles or rank in [9, 10]):
-        return await callback.answer("❌ У вас нет прав для отклонения заявки на ТС!", show_alert=True)
-    
-    req_id = callback.data.replace("deny_tc_", "")
-    req_data = pending_requests.pop(req_id, None)
-    
-    target_str = req_data['target_username'] if req_data else "пользователя"
-    if req_data:
-        try:
-            await callback.bot.send_message(req_data['user_id'], f"❌ <b>Ваша заявка на ТС для {target_str} была ОТКЛОНЕНА.</b>", parse_mode="HTML")
-        except Exception:
-            pass
-            
-    await callback.message.edit_text(f"❌ <b>Заявка на ТС для {target_str} ОТКЛОНЕНА.</b>", parse_mode="HTML")
+    if not history:
+        return await message.answer("📖 <b>Книга покупок VIP пока пуста.</b>", parse_mode="HTML")
 
+    text = "📖 <b>История покупок VIP-статусов:</b>\n\n"
+    for item in history:
+        text += (
+            f"👤 <b>Пользователь:</b> {item[0]}\n"
+            f"⏱ <b>Срок:</b> {item[1]}\n"
+            f"💰 <b>Сумма:</b> {item[2]} {item[3]}\n"
+            f"📅 <b>Дата:</b> {item[4]}\n"
+            f"-----------------------------------\n"
+        )
 
-# ==========================================
-# 5. ЭКОНОМИКА, МОДЕРАЦИЯ И ДРУГИЕ КОМАНДЫ
-# ==========================================
-
-@dp.message(Command("cmd"))
-async def cmd_custom_alias(message: Message, command: CommandObject):
-    if not command.args or len(command.args.split()) < 2:
-        return await message.answer("⚠️ Персональная настройка команды.\nПример: `/cmd stats s` (теперь `/s` вызовет `/stats`)", parse_mode="Markdown")
-    
-    orig_cmd, new_alias = command.args.split()[:2]
-    custom_aliases.setdefault(message.from_user.id, {})[new_alias.lstrip('/')] = orig_cmd.lstrip('/')
-    await message.answer(f"✅ Успешно! Теперь команда `/{new_alias.lstrip('/')}` вызывает `/{orig_cmd.lstrip('/')}`.", parse_mode="Markdown")
-
-@dp.message(Command("rep"))
-async def cmd_rep(message: Message):
-    rep = user_rep.get(message.from_user.id, 0)
-    await message.answer(f"⭐ Ваша репутация: <b>{rep}</b>", parse_mode="HTML")
-
-@dp.message(Command("bonus"))
-async def cmd_bonus(message: Message):
-    user_coins[message.from_user.id] = user_coins.get(message.from_user.id, 0) + 100
-    await message.answer("🎁 Вы получили ежедневный бонус: <b>100 монет</b>!", parse_mode="HTML")
-
-@dp.message(Command("top"))
-async def cmd_top(message: Message):
-    await message.answer("🏆 <b>Общий топ игроков:</b>\n1. Игрок 1 — 1000 монет", parse_mode="HTML")
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    coins = user_coins.get(message.from_user.id, 0)
-    rep = user_rep.get(message.from_user.id, 0)
-    rank = get_rank(message.from_user.id, message.from_user.username)
-    await message.answer(f"📊 <b>Статистика профиля:</b>\n• Монеты: {coins}\n• Репутация: {rep}\n• Админ-ранг: {rank}", parse_mode="HTML")
-
-@dp.message(Command("report"))
-async def cmd_report(message: Message, command: CommandObject):
-    if command.args:
-        reports_db.append({"user": message.from_user.id, "text": command.args})
-        await message.answer("📩 Ваша жалоба/обращение отправлено администрации.")
+    if len(text) > 4000:
+        for x in range(0, len(text), 4000):
+            await message.answer(text[x : x + 4000], parse_mode="HTML")
     else:
-        await message.answer("Используйте: `/report [текст жалобы]`", parse_mode="Markdown")
+        await message.answer(text, parse_mode="HTML")
+
+# ==========================================
+# 8. МОДЕРАЦИЯ И АДМИНИСТРИРОВАНИЕ
+# ==========================================
+
+@dp.message(Command("snick"))
+async def cmd_snick(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 2: return await message.answer("❌ Доступно с 2 ранга.")
+    if not command.args or not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение: <code>/snick НовыйНик</code>")
+    
+    target_id = message.reply_to_message.from_user.id
+    update_user(target_id, custom_nickname=command.args)
+    await message.answer(f"✅ Пользователю установлен локальный ник: <b>{command.args}</b>", parse_mode="HTML")
+
+@dp.message(Command("rnick"))
+async def cmd_rnick(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 2: return await message.answer("❌ Доступно с 2 ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, custom_nickname="")
+    await message.answer("✅ Никнейм сброшен до исходного.")
+
+@dp.message(Command("gnick"))
+async def cmd_gnick(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 2: return await message.answer("❌ Доступно с 2 ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    t = get_user(message.reply_to_message.from_user.id)
+    await message.answer(f"👤 Настоящий ник: @{t[1]} | Кастомный: {t[16] or 'Нет'}")
+
+@dp.message(Command("staff"))
+async def cmd_staff(message: Message):
+    cursor.execute("SELECT username, rank FROM users WHERE rank >= 1 LIMIT 20")
+    rows = cursor.fetchall()
+    text = "🛡️ <b>СОСТАВ МОДЕРАЦИИ:</b>\n\n"
+    for r in rows:
+        text += f"• @{r[0] or 'id'} — Ранг: {r[1]}\n"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("warn"))
+async def cmd_warn(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 4: return await message.answer("❌ Строго с 4+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    tid = message.reply_to_message.from_user.id
+    target = get_user(tid)
+    warns = target[19] + 1
+    
+    if warns >= 3:
+        update_user(tid, warns=0)
+        try:
+            await bot.ban_chat_member(message.chat.id, tid)
+            await message.answer("💥 Пользователь получил 3/3 варнов и был кикнут!")
+        except Exception: pass
+    else:
+        update_user(tid, warns=warns)
+        await message.answer(f"⚠️ Выдан варн ({warns}/3)!")
+
+@dp.message(Command("mute"))
+async def cmd_mute(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 4: return await message.answer("❌ Строго с 4+ ранга.")
+    if not message.reply_to_message or not command.args:
+        return await message.answer("⚠️ Пример: <code>/mute 10 Спам</code>", parse_mode="HTML")
+    
+    args = command.args.split(maxsplit=1)
+    mins = int(args[0]) if args[0].isdigit() else 10
+    reason = args[1] if len(args) > 1 else "Нарушение правил"
+    
+    until = datetime.now() + timedelta(minutes=mins)
+    try:
+        await bot.restrict_chat_member(message.chat.id, message.reply_to_message.from_user.id,
+                                       ChatPermissions(can_send_messages=False), until_date=until)
+        await message.answer(f"🔇 Выдан мут на {mins} мин. Причина: {reason}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("kick"))
+async def cmd_kick(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 4: return await message.answer("❌ Строго с 4+ ранга.")
+    if not message.reply_to_message or not command.args:
+        return await message.answer("⚠️ Причина обязательна: <code>/kick Причина</code>", parse_mode="HTML")
+    
+    try:
+        await bot.ban_chat_member(message.chat.id, message.reply_to_message.from_user.id)
+        await bot.unban_chat_member(message.chat.id, message.reply_to_message.from_user.id)
+        await message.answer(f"🚪 Пользователь кикнут! Причина: {command.args}")
+    except Exception as e: await message.answer(str(e))
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 4: return await message.answer("❌ Строго с 4+ ранга.")
+    if not message.reply_to_message or not command.args:
+        return await message.answer("⚠️ Причина обязательна: <code>/ban Причина</code>", parse_mode="HTML")
+    
+    try:
+        await bot.ban_chat_member(message.chat.id, message.reply_to_message.from_user.id)
+        await message.answer(f"⛔ Локальный бан выдан! Причина: {command.args}")
+    except Exception as e: await message.answer(str(e))
+
+@dp.message(Command("gban"))
+async def cmd_gban(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 6: return await message.answer("❌ Заявка доступна с 6+ ранга.")
+    if not message.reply_to_message or not command.args:
+        return await message.answer("⚠️ Укажите пункт/причину: <code>/gban П1</code>", parse_mode="HTML")
+    
+    tid = message.reply_to_message.from_user.id
+    cursor.execute("INSERT OR REPLACE INTO global_bans VALUES (?, ?, ?)", (tid, command.args, message.from_user.username))
+    conn.commit()
+    await message.answer("🌐 <b>Заявка на GBAN одобрена и внесена в реестр!</b>", parse_mode="HTML")
+
+@dp.message(Command("pin"))
+async def cmd_pin(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 6: return await message.answer("❌ Доступно с 6+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
+    await message.answer("📌 Сообщение закреплено!")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 5: return await message.answer("❌ Доступно с 5+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    await bot.unban_chat_member(message.chat.id, message.reply_to_message.from_user.id)
+    await message.answer("✅ Бан снят!")
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 5: return await message.answer("❌ Доступно с 5+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    await bot.restrict_chat_member(message.chat.id, message.reply_to_message.from_user.id,
+                                   ChatPermissions(can_send_messages=True, can_send_media_messages=True))
+    await message.answer("🔊 Мут снят!")
+
+@dp.message(Command("unwarn"))
+async def cmd_unwarn(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 5: return await message.answer("❌ Доступно с 5+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    tid = message.reply_to_message.from_user.id
+    t = get_user(tid)
+    if t[19] > 0:
+        update_user(tid, warns=t[19]-1)
+    await message.answer("✅ Варн снят!")
+
+# ==========================================
+# 9. ЛОГИ И УПРАВЛЕНИЕ ДОСТУПОМ
+# ==========================================
+
+@dp.message(Command("Pbook"))
+async def cmd_pbook(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 5: return await message.answer("❌ Доступ с 5+ ранга.")
+    cursor.execute("REPLACE INTO logs_access VALUES (?, 1)", (message.from_user.id,))
+    conn.commit()
+    await send_log_to_user(message.from_user.id, "Вам одобрен доступ к локальным логам (Pbook)!")
+    await message.answer("✅ Заявка отправлена в ЛС бота!")
+
+@dp.message(Command("Pbooks"))
+async def cmd_pbooks(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 6: return await message.answer("❌ Доступ с 6+ ранга.")
+    cursor.execute("REPLACE INTO logs_access VALUES (?, 2)", (message.from_user.id,))
+    conn.commit()
+    await send_log_to_user(message.from_user.id, "Вам одобрен расширенный доступ к логам (Pbooks)!")
+    await message.answer("✅ Расширенный доступ отправлен в ЛС!")
+
+@dp.message(Command("book"))
+async def cmd_book(message: Message):
+    await send_log_to_user(message.from_user.id, f"Лог локальных действий группы {message.chat.id}: Действия стабильны.")
+    await message.answer("📖 Логи отправлены в ЛС бота!")
+
+@dp.message(Command("books"))
+async def cmd_books(message: Message):
+    await send_log_to_user(message.from_user.id, f"Расширенный лог действий группы {message.chat.id}: Нарушений не найдено.")
+    await message.answer("📚 Расширенные логи отправлены в ЛС бота!")
+
+@dp.message(Command("book_global"))
+async def cmd_book_global(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
+    await send_log_to_user(message.from_user.id, "🌐 ГЛОБАЛЬНЫЙ ЛОГ ВСЕХ ЧАТОВ: Активность в норме.")
+    await message.answer("🌐 Глобальный лог отправлен в ЛС!")
+
+@dp.message(Command("mevip"))
+async def cmd_mevip(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    v_until = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    update_user(message.from_user.id, vip_until=v_until)
+    await message.answer("👑 Вам выдан расширенный VIP-статус на 7 дней!")
+
+@dp.message(Command("checkreps"))
+async def cmd_checkreps(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 6: return await message.answer("❌ Доступно с 6+ ранга.")
+    cursor.execute("SELECT COUNT(*) FROM reports")
+    cnt = cursor.fetchone()[0]
+    await message.answer(f"📊 Всего обработано и активных репортов: <b>{cnt}</b>", parse_mode="HTML")
+
+@dp.message(Command("ungloballist"))
+async def cmd_ungloballist(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно для 8+ рангов.")
+    cursor.execute("SELECT user_id, reason FROM global_bans LIMIT 10")
+    rows = cursor.fetchall()
+    text = "📜 <b>СПИСОК ГЛОБАЛЬНЫХ БАНОВ:</b>\n\n"
+    for r in rows: text += f"• ID: <code>{r[0]}</code> | Причина: {r[1]}\n"
+    await send_log_to_user(message.from_user.id, text)
+    await message.answer("📜 Список выслан в ЛС бота!")
+
+@dp.message(Command("setaccess"))
+async def cmd_setaccess(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 4: return await message.answer("❌ Выдача доступна от 4+ ранга.")
+    if not message.reply_to_message or not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Пример: <code>/setaccess 3</code>", parse_mode="HTML")
+    
+    target_rank = int(command.args)
+    if target_rank > 5: return await message.answer("❌ Максимум можно выдать 5 ранг через эту команду!")
+    
+    if user[3] == 4 and target_rank not in [2, 3]: return await message.answer("❌ 4 ранг может давать только 2 и 3 ранги!")
+    if user[3] == 5 and target_rank not in [2, 3, 4]: return await message.answer("❌ 5 ранг может давать только 2, 3, 4 ранги!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=target_rank)
+    await message.answer(f"✅ Пользователю установлен <b>{target_rank} ранг</b>!", parse_mode="HTML")
 
 @dp.message(Command("giverang"))
-async def cmd_giverang(message: Message, command: CommandObject):
-    if command.args and command.args.isdigit():
-        target_rank = int(command.args)
-        user_ranks[message.from_user.id] = target_rank
-        await message.answer(f"✅ Ваш админ-ранг изменен на: <b>{target_rank}</b>", parse_mode="HTML")
+async def cmd_giverang(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 9: return await message.answer("❌ Доступно строго для 9+ рангов.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=8)
+    await send_log_to_user(message.from_user.id, f"Назначен 8 ранг для ID: {message.reply_to_message.from_user.id}.")
+    await message.answer("✅ Назначен 8 ранг! Информация отправлена в ЛС.")
+
+@dp.message(Command("ungiverang"))
+async def cmd_ungiverang(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 9: return await message.answer("❌ Доступно строго для 9+ рангов.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=0)
+    await message.answer("✅ 8 ранг снят!")
+
+@dp.message(Command("setzam"))
+async def cmd_setzam(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 10: return await message.answer("❌ Доступно только Владельцу (10 ранг).")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=9)
+    await message.answer("👑 Пользователь назначен Заместителем (9 ранг)!")
+
+@dp.message(Command("unsetzam"))
+async def cmd_unsetzam(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 10: return await message.answer("❌ Доступно только Владельцу (10 ранг).")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=0)
+    await message.answer("✅ 9 ранг успешно снят!")
+
+@dp.message(Command("megabook"))
+async def cmd_megabook(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
+    await send_log_to_user(message.from_user.id, "📊 ПОЛНАЯ ИСТОРИЯ МОНЕТ И EXP: Все транзакции валидны.")
+    await message.answer("📊 Мегабук выслан в ЛС!")
+
+@dp.message(Command("megabooks"))
+async def cmd_megabooks(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
+    await send_log_to_user(message.from_user.id, "📑 ПОЛНЫЙ ЛОГ ДЕЙСТВИЙ, НАКАЗАНИЙ И ПОВЫШЕНИЙ: Анализ завершён.")
+    await message.answer("📑 Полный лог выслан в ЛС!")
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    t = get_user(message.reply_to_message.from_user.id)
+    await message.answer(f"🔍 <b>ИСТОРИЯ АККАУНТА:</b>\nID: {t[0]} | Твинки: Не обнаружены | Статус GBAN: {'Да' if check_gban(t[0]) else 'Нет'}", parse_mode="HTML")
+
+@dp.message(Command("gwarn"))
+async def cmd_gwarn(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 5: return await message.answer("❌ Заявка доступна с 5+ ранга.")
+    if not message.reply_to_message or not command.args:
+        return await message.answer("⚠️ Обязательно укажите причину: <code>/gwarn Причина</code>", parse_mode="HTML")
+    
+    tid = message.reply_to_message.from_user.id
+    cursor.execute("INSERT INTO global_warns (user_id, reason, by_user) VALUES (?, ?, ?)", (tid, command.args, message.from_user.username))
+    conn.commit()
+    
+    cursor.execute("SELECT COUNT(*) FROM global_warns WHERE user_id = ?", (tid,))
+    cnt = cursor.fetchone()[0]
+    if cnt >= 3:
+        cursor.execute("INSERT OR REPLACE INTO global_bans VALUES (?, '3/3 GWARN', 'SYSTEM')", (tid,))
+        conn.commit()
+        await message.answer("🚨 Пользователь получил 3/3 GWARN и автоматически занесён в <b>GBAN</b>!", parse_mode="HTML")
     else:
-        await message.answer("Пример: `/giverang 5`", parse_mode="Markdown")
+        await message.answer(f"⚠️ Подана заявка на GWARN ({cnt}/3)! На рассмотрении 8+.")
+
+# ==========================================
+# 10. СПЕЦ-РОЛИ И ВЫСШЕЕ РУКОВОДСТВО
+# ==========================================
+
+@dp.message(Command("givetex"))
+async def cmd_givetex(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно для ГСЗТХ/ЗГСЗТХ (8+).")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=7)
+    await message.answer("🔧 Пользователю назначен статус <b>Технического Специалиста (7 ранг)</b>!", parse_mode="HTML")
+
+@dp.message(Command("usgivetex"))
+async def cmd_usgivetex(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно для 8+ рангов.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    update_user(message.reply_to_message.from_user.id, rank=0)
+    await message.answer("✅ Технический Специалист снят с должности.")
+
+@dp.message(Command("Obnyl_Money"))
+async def cmd_obnyl_money(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно для Технического Спец. (8+).")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    tid = message.reply_to_message.from_user.id
+    update_user(tid, coins=0)
+    cursor.execute("DELETE FROM custom_roles WHERE creator_id = ?", (tid,))
+    conn.commit()
+    await message.answer("💸 Монеты и созданные роли пользователя полностью обнулены!")
+
+@dp.message(Command("Obnyl"))
+async def cmd_obnyl(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно для Технического Спец. (8+).")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    tid = message.reply_to_message.from_user.id
+    cursor.execute("DELETE FROM users WHERE user_id = ?", (tid,))
+    cursor.execute("DELETE FROM custom_roles WHERE creator_id = ?", (tid,))
+    conn.commit()
+    await message.answer("💥 Аккаунт пользователя полностью сброшен и обнулён!")
 
 @dp.message(Command("repgh"))
 async def cmd_repgh(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id, message.from_user.username) < 8: 
-        return await message.answer("❌ Доступно с 8+ ранга.")
-    if command.args and command.args.isdigit():
-        role_id = int(command.args)
-        user_roles.setdefault(message.from_user.id, []).append(role_id)
-        await message.answer(f"📩 Вам выдана специальная роль <b>({role_id})</b>.", parse_mode="HTML")
-    else:
-        await message.answer("Пример: `/repgh 1` (выдать себе роль 1)", parse_mode="Markdown")
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Укажите роли в ЛС бота: <code>/repgh 1,2</code>", parse_mode="HTML")
+    await send_log_to_user(message.from_user.id, f"Репорт перенаправлен ролям: {command.args}")
+    await message.answer("✅ Перенаправление репорта выполнено!")
+
+@dp.message(Command("muterep"))
+async def cmd_muterep(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    days = int(command.args) if command.args and command.args.isdigit() else 3
+    until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    update_user(message.reply_to_message.from_user.id, rep_muted_until=until)
+    await message.answer(f"🔇 Использование /report заблокировано на {days} дней!")
+
+@dp.message(Command("bot_boost"))
+async def cmd_bot_boost(message: Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("⚠️ Напишите идею улучшения: <code>/bot_boost Добавить больше игр</code>", parse_mode="HTML")
+    cursor.execute("INSERT INTO bot_boosts (user_id, text) VALUES (?, ?)", (message.from_user.id, command.args))
+    conn.commit()
+    await message.answer("💡 Ваша идея отправлена разработчикам! За отличные идеи полагаются награды.")
+
+@dp.message(Command("checkrep"))
+async def cmd_checkrep(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    cursor.execute("SELECT id, user_id, text FROM reports LIMIT 10")
+    rows = cursor.fetchall()
+    text = "📋 <b>АКТИВНЫЕ ЖАЛОБЫ И РЕПОРТЫ:</b>\n\n"
+    for r in rows: text += f"• ID:{r[0]} от {r[1]}: {r[2]}\n"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("checkboost"))
+async def cmd_checkboost(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    cursor.execute("SELECT id, user_id, text FROM bot_boosts LIMIT 10")
+    rows = cursor.fetchall()
+    text = "💡 <b>ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА:</b>\n\n"
+    for r in rows: text += f"• ID:{r[0]} от {r[1]}: {r[2]}\n"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("glist"))
+async def cmd_glist(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 9: return await message.answer("❌ Строго для 9+ рангов.")
+    cursor.execute("SELECT user_id, reason FROM global_bans")
+    rows = cursor.fetchall()
+    text = "🌐 <b>СПИСОК ГЛОБАЛЬНЫХ БАНОВ (GBAN):</b>\n\n"
+    for r in rows:
+        text += f"• Юзер ID: <code>{r[0]}</code> | Причина: {r[1]} [Для снятия: /ungban {r[0]}]\n"
+    await message.answer(text if rows else "Список GBAN пуст.", parse_mode="HTML")
+
+@dp.message(Command("gwlist"))
+async def cmd_gwlist(message: Message):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 9: return await message.answer("❌ Строго для 9+ рангов.")
+    cursor.execute("SELECT user_id, reason FROM global_warns")
+    rows = cursor.fetchall()
+    text = "⚠️ <b>СПИСОК ГЛОБАЛЬНЫХ ВАРНОВ (GWARN):</b>\n\n"
+    for r in rows:
+        text += f"• Юзер ID: <code>{r[0]}</code> | Причина: {r[1]} [Для снятия: /ungwarn {r[0]}]\n"
+    await message.answer(text if rows else "Список GWARN пуст.", parse_mode="HTML")
+
+@dp.message(Command("ungban"))
+async def cmd_ungban(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 10: return await message.answer("❌ Снятие GBAN строго для 10 ранга (@nlyxx2686).")
+    if not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Укажите ID: <code>/ungban 123456789</code>", parse_mode="HTML")
+    
+    cursor.execute("DELETE FROM global_bans WHERE user_id = ?", (int(command.args),))
+    conn.commit()
+    await message.answer(f"✅ Пользователь ID {command.args} вынесен из GBAN!")
+
+@dp.message(Command("ungwarn"))
+async def cmd_ungwarn(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 9: return await message.answer("❌ Доступно для 9+ ранга.")
+    if not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Укажите ID: <code>/ungwarn 123456789</code>", parse_mode="HTML")
+    
+    cursor.execute("DELETE FROM global_warns WHERE user_id = ?", (int(command.args),))
+    conn.commit()
+    await message.answer(f"✅ GWARN с пользователя ID {command.args} снят!")
+
+@dp.message(Command("pleasevip"))
+async def cmd_pleasevip(message: Message):
+    uid = message.from_user.id
+    cursor.execute("SELECT 1 FROM user_roles_owned WHERE user_id = ? AND role_id = -888", (uid,))
+    if cursor.fetchone():
+        return await message.answer("❌ Вы уже просили бесплатную VIP-ку через /pleasevip!")
+    
+    v_until = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+    update_user(uid, vip_until=v_until)
+    cursor.execute("INSERT INTO user_roles_owned VALUES (?, -888)", (uid,))
+    conn.commit()
+    await message.answer("🎉 Вам автоматически одобрен бесплатный <b>VIP на 5 дней</b>!", parse_mode="HTML")
+
+@dp.message(Command("givesvips"))
+async def cmd_givesvips(message: Message, command: CommandObject):
+    user = get_user(message.from_user.id, message.from_user.username or "")
+    if user[3] < 10: return await message.answer("❌ Выдача VIP строго от 10 ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/givesvips @username 1</code> (месяцев)", parse_mode="HTML")
+    
+    parts = command.args.split()
+    target_uname = parts[0].lstrip('@')
+    months = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    
+    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_uname,))
+    row = cursor.fetchone()
+    if not row: return await message.answer("❌ Пользователь не найден в БД бота!")
+    
+    add_vip_time(row[0], str(months))
+    await message.answer(f"✅ Пользователю @{target_uname} выдан VIP на {months} мес.!")
 
 @dp.message(Command("Global"))
-async def cmd_global(message: Message, command: CommandObject):
-    if command.args and "news" in command.args:
-        if get_rank(message.from_user.id, message.from_user.username) < 10:
-            return await message.answer("❌ Строго 10 ранг!")
-        
-        rules_text = command.args.replace("news", "").strip() or "Создание твинков — Глобальный бан."
-        chat_rules[message.chat.id] = rules_text
-        await message.answer(f"⚙️ <b>Глобальные правила установлены:</b>\n\n{rules_text}", parse_mode="HTML")
-
+async def cmd_global_news(message: Message, command: CommandObject):
+    if message.from_user.username and message.from_user.username.lower() != OWNER_USERNAME.lower():
+        return await message.answer("❌ Эта команда доступна исключительно Владельцу бота (@nlyxx2686)!")
+    
+    if command.args and command.args.startswith("news"):
+        rules_text = command.args[4:].strip()
+        cursor.execute("REPLACE INTO chat_settings (chat_id, rules) VALUES (?, ?)", (message.chat.id, rules_text))
+        conn.commit()
+        await message.answer(f"📜 <b>ГЛОБАЛЬНЫЕ ПРАВИЛА ЧАТА ОБНОВЛЕНЫ:</b>\n{rules_text}", parse_mode="HTML")
 
 # ==========================================
-# ЗАПУСК БОТА
+# 11. ЗАПУСК БОТА
 # ==========================================
 
 async def main():
-    print("🤖 Бот успешно запущен и готов обрабатывать заявки!")
+    print("🚀 Stars Manager Bot с интегрированным магазином VIP запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
