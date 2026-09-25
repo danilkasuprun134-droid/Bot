@@ -4,7 +4,6 @@ import logging
 import random
 import asyncio
 import sqlite3
-import datetime
 from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask
@@ -148,7 +147,6 @@ def init_db():
         PRIMARY KEY (user_id, alias)
     )''')
 
-    # Новые таблицы для Магазина VIP
     cursor.execute('''CREATE TABLE IF NOT EXISTS pending_vip_orders (
         order_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -212,9 +210,12 @@ def get_user(user_id: int, username: str = ""):
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
     else:
+        # Индекс 3 равен rank
         if username and username.lstrip('@').lower() == OWNER_USERNAME.lower() and row[3] != 10:
             cursor.execute("UPDATE users SET rank = 10 WHERE user_id = ?", (user_id,))
             conn.commit()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
     return row
 
 def update_user(user_id: int, **kwargs):
@@ -231,7 +232,7 @@ def is_vip(user_row) -> bool:
     try:
         until = datetime.strptime(user_row[13], "%Y-%m-%d %H:%M:%S")
         return datetime.now() < until
-    except:
+    except Exception:
         return False
 
 def add_vip_time(user_id: int, period: str):
@@ -253,7 +254,10 @@ def add_vip_time(user_id: int, period: str):
     update_user(user_id, vip_until=new_until.strftime("%Y-%m-%d %H:%M:%S"))
 
 def check_gban(user_id: int) -> bool:
-    if user_id == 10: return False
+    cursor.execute("SELECT rank FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if row and row[0] == 10: 
+        return False
     cursor.execute("SELECT 1 FROM global_bans WHERE user_id = ?", (user_id,))
     return cursor.fetchone() is not None
 
@@ -684,7 +688,7 @@ async def cmd_report(message: Message, command: CommandObject):
     await message.answer("🚨 Ваша жалоба отправлена администрации!")
 
 # ==========================================
-# 7. ИНТЕГРИРОВАННЫЙ МАГААИН VIP (UAH / TG STARS)
+# 7. ИНТЕГРИРОВАННЫЙ МАГАЗИН VIP (UAH / TG STARS)
 # ==========================================
 
 def get_vip_currency_keyboard():
@@ -780,7 +784,6 @@ async def process_uah_paid(callback: CallbackQuery):
         except Exception:
             pass
 
-# Oплата через Stars
 @dp.callback_query(F.data.startswith("select_stars_"))
 async def process_stars_selection(callback: CallbackQuery):
     period = callback.data.split("_")[2]
@@ -817,10 +820,8 @@ async def successful_payment_handler(message: Message):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     period_str = "Навсегда" if period == "forever" else f"{period} мес."
 
-    # Начисляем VIP в базу
     add_vip_time(user.id, period)
 
-    # Сохраняем в историю
     cursor.execute(
         "INSERT INTO vip_history (user_id, username, price, currency, period, date) VALUES (?, ?, ?, ?, ?, ?)",
         (user.id, username, str(price), "звезд TG", period_str, now_str)
@@ -997,7 +998,7 @@ async def cmd_snick(message: Message, command: CommandObject):
     user = get_user(message.from_user.id, message.from_user.username or "")
     if user[3] < 2: return await message.answer("❌ Доступно с 2 ранга.")
     if not command.args or not message.reply_to_message:
-        return await message.answer("⚠️ Ответьте на сообщение: <code>/snick НовыйНик</code>")
+        return await message.answer("⚠️ Ответьте на сообщение: <code>/snick НовыйНик</code>", parse_mode="HTML")
     
     target_id = message.reply_to_message.from_user.id
     update_user(target_id, custom_nickname=command.args)
@@ -1487,6 +1488,8 @@ async def cmd_global_news(message: Message, command: CommandObject):
         cursor.execute("REPLACE INTO chat_settings (chat_id, rules) VALUES (?, ?)", (message.chat.id, rules_text))
         conn.commit()
         await message.answer(f"📜 <b>ГЛОБАЛЬНЫЕ ПРАВИЛА ЧАТА ОБНОВЛЕНЫ:</b>\n{rules_text}", parse_mode="HTML")
+    else:
+        await message.answer("⚠️ Использование: <code>/Global news [Текст правил]</code>", parse_mode="HTML")
 
 # ==========================================
 # 11. ЗАПУСК БОТА
