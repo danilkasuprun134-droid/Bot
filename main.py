@@ -63,7 +63,7 @@ conn = sqlite3.connect("bot_database.db", check_same_thread=False)
 cursor = conn.cursor()
 
 def clean_username(username: str) -> str:
-    """Чистит юзернейм от @ и приводить к нижнему регистру"""
+    """Чистит юзернейм от @ и приводит к нижнему регистру"""
     if not username:
         return ""
     return username.replace("@", "").strip().lower()
@@ -207,13 +207,12 @@ def get_user(user_id: int = None, username: str = ""):
         rank = 10 if user_id == OWNER_ID or (u_clean and u_clean == OWNER_USERNAME.lower()) else 0
         cursor.execute(
             "INSERT INTO users (user_id, username, rank, coins) VALUES (?, ?, ?, ?)",
-            (user_id, u_clean, rank, 100) # По дефолту даем 100 монет из 1-го кода
+            (user_id, u_clean, rank, 100)
         )
         conn.commit()
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
     elif row and u_clean and row[1] != u_clean:
-        # Обновляем Username если он изменился в TG
         cursor.execute("UPDATE users SET username = ? WHERE user_id = ?", (u_clean, row[0]))
         conn.commit()
         
@@ -370,7 +369,6 @@ async def cmd_start(message: Message):
 async def cmd_profile(message: Message):
     args = message.text.split()
     
-    # Если передали @username (например /profile @durov)
     if len(args) > 1:
         target_username = args[1]
         user = get_user(username=target_username)
@@ -395,7 +393,6 @@ async def cmd_profile(message: Message):
 
 @dp.message(Command("setadmin"))
 async def cmd_setadmin(message: Message):
-    # Проверка на администратора/владельца
     user = get_user(user_id=message.from_user.id)
     if user[3] < 10 and message.from_user.id != OWNER_ID:
         await message.answer("❌ У вас нет прав на эту команду.")
@@ -410,7 +407,6 @@ async def cmd_setadmin(message: Message):
     success = set_role(target_username, "Admin")
 
     if success:
-        # Также обновляем внутренний системный ранг до администратора
         target_user = get_user(username=target_username)
         if target_user:
             update_user(target_user[0], rank=5)
@@ -1591,310 +1587,226 @@ async def cmd_mevip(message: Message):
     if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
     v_until = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     update_user(message.from_user.id, vip_until=v_until)
-    await message.answer("👑 Вам выдан расширенный VIP-статус на 7 дней!")
+    await message.answer("👑 Вам выдан тестовый расширенный VIP-статус на 7 дней!", parse_mode="HTML")
 
-@dp.message(Command("checkreps"))
-async def cmd_checkreps(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 6: return await message.answer("❌ Доступно с 6+ ранга.")
-    cursor.execute("SELECT COUNT(*) FROM reports")
-    cnt = cursor.fetchone()[0]
-    await message.answer(f"📊 Всего обработано и активных репортов: <b>{cnt}</b>", parse_mode="HTML")
-
-@dp.message(Command("ungloballist"))
-async def cmd_ungloballist(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно для 8+ рангов.")
-    cursor.execute("SELECT user_id, reason FROM global_bans LIMIT 10")
-    rows = cursor.fetchall()
-    text = "📜 <b>СПИСОК ГЛОБАЛЬНЫХ БАНОВ:</b>\n\n"
-    for r in rows: text += f"• ID: <code>{r[0]}</code> | Причина: {r[1]}\n"
-    await send_log_to_user(message.from_user.id, text)
-    await message.answer("📜 Список выслан в ЛС бота!")
+# ==========================================
+# 11. РАСШИРЕННОЕ УПРАВЛЕНИЕ РАНГАМИ И ВЛАСТЬЮ
+# ==========================================
 
 @dp.message(Command("setaccess"))
 async def cmd_setaccess(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 4: return await message.answer("❌ Выдача доступна от 4+ ранга.")
-    if not message.reply_to_message or not command.args or not command.args.isdigit():
-        return await message.answer("⚠️ Пример: <code>/setaccess 3</code>", parse_mode="HTML")
-    
-    target_rank = int(command.args)
-    if target_rank > 5: return await message.answer("❌ Максимум можно выдать 5 ранг через эту команду!")
-    
-    if user[3] == 4 and target_rank not in [2, 3]: return await message.answer("❌ 4 ранг может давать только 2 и 3 ранги!")
-    if user[3] == 5 and target_rank not in [2, 3, 4]: return await message.answer("❌ 5 ранг может давать только 2, 3, 4 ранги!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=target_rank)
-    await message.answer(f"✅ Пользователю установлен <b>{target_rank} ранг</b>!", parse_mode="HTML")
-
-@dp.message(Command("giverang"))
-async def cmd_giverang(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 9: return await message.answer("❌ Доступно строго для 9+ рангов.")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=8)
-    await send_log_to_user(message.from_user.id, f"Назначен 8 ранг для ID: {message.reply_to_message.from_user.id}.")
-    await message.answer("✅ Назначен 8 ранг! Информация отправлена в ЛС.")
-
-@dp.message(Command("ungiverang"))
-async def cmd_ungiverang(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 9: return await message.answer("❌ Доступно строго для 9+ рангов.")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=0)
-    await message.answer("✅ 8 ранг снят!")
-
-@dp.message(Command("setzam"))
-async def cmd_setzam(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 10: return await message.answer("❌ Доступно только Владельцу (10 ранг).")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=9)
-    await message.answer("👑 Пользователь назначен Заместителем (9 ранг)!")
-
-@dp.message(Command("unsetzam"))
-async def cmd_unsetzam(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 10: return await message.answer("❌ Доступно только Владельцу (10 ранг).")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=0)
-    await message.answer("✅ 9 ранг успешно снят!")
-
-@dp.message(Command("megabook"))
-async def cmd_megabook(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
-    await send_log_to_user(message.from_user.id, "📊 ПОЛНАЯ ИСТОРИЯ МОНЕТ И EXP: Все транзакции валидны.")
-    await message.answer("📊 Мегабук выслан в ЛС!")
-
-@dp.message(Command("megabooks"))
-async def cmd_megabooks(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
-    await send_log_to_user(message.from_user.id, "📑 ПОЛНЫЙ ЛОГ ДЕЙСТВИЙ, НАКАЗАНИЙ И ПОВЫШЕНИЙ: Анализ завершён.")
-    await message.answer("📑 Полный лог выслан в ЛС!")
-
-@dp.message(Command("history"))
-async def cmd_history(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    t = get_user(user_id=message.reply_to_message.from_user.id)
-    await message.answer(f"🔍 <b>ИСТОРИЯ АККАУНТА:</b>\nID: {t[0]} | Твинки: Не обнаружены | Статус GBAN: {'Да' if check_gban(t[0]) else 'Нет'}", parse_mode="HTML")
-
-@dp.message(Command("gwarn"))
-async def cmd_gwarn(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 5: return await message.answer("❌ Заявка доступна с 5+ ранга.")
-    if not message.reply_to_message or not command.args:
-        return await message.answer("⚠️ Обязательно укажите причину: <code>/gwarn Причина</code>", parse_mode="HTML")
-    
-    tid = message.reply_to_message.from_user.id
-    cursor.execute("INSERT INTO global_warns (user_id, reason, by_user) VALUES (?, ?, ?)", (tid, command.args, message.from_user.username))
-    conn.commit()
-    
-    cursor.execute("SELECT COUNT(*) FROM global_warns WHERE user_id = ?", (tid,))
-    cnt = cursor.fetchone()[0]
-    if cnt >= 3:
-        cursor.execute("INSERT OR REPLACE INTO global_bans VALUES (?, '3/3 GWARN', 'SYSTEM')", (tid,))
-        conn.commit()
-        await message.answer("🚨 Пользователь получил 3/3 GWARN и автоматически занесён в <b>GBAN</b>!", parse_mode="HTML")
-    else:
-        await message.answer(f"⚠️ Подана заявка на GWARN ({cnt}/3)! На рассмотрении 8+.")
-
-# ==========================================
-# 11. СПЕЦ-РОЛИ И ВЫСШЕЕ РУКОВОДСТВО
-# ==========================================
-
-@dp.message(Command("givetex"))
-async def cmd_givetex(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно для ГСЗТХ/ЗГСЗТХ (8+).")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=7)
-    await message.answer("🔧 Пользователю назначен статус <b>Технического Специалиста (7 ранг)</b>!", parse_mode="HTML")
-
-@dp.message(Command("usgivetex"))
-async def cmd_usgivetex(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно для 8+ рангов.")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    update_user(message.reply_to_message.from_user.id, rank=0)
-    await message.answer("✅ Технический Специалист снят с должности.")
-
-@dp.message(Command("Obnyl_Money"))
-async def cmd_obnyl_money(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно для Технического Спец. (8+).")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    tid = message.reply_to_message.from_user.id
-    update_user(tid, coins=0)
-    cursor.execute("DELETE FROM custom_roles WHERE creator_id = ?", (tid,))
-    conn.commit()
-    await message.answer("💸 Монеты и созданные роли пользователя полностью обнулены!")
-
-@dp.message(Command("Obnyl"))
-async def cmd_obnyl(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно для Технического Спец. (8+).")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    tid = message.reply_to_message.from_user.id
-    cursor.execute("DELETE FROM users WHERE user_id = ?", (tid,))
-    cursor.execute("DELETE FROM custom_roles WHERE creator_id = ?", (tid,))
-    conn.commit()
-    await message.answer("💥 Аккаунт пользователя полностью сброшен и обнулён!")
-
-@dp.message(Command("repgh"))
-async def cmd_repgh(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
-    if not command.args:
-        return await message.answer("⚠️ Укажите роли в ЛС бота: <code>/repgh 1,2</code>", parse_mode="HTML")
-    await send_log_to_user(message.from_user.id, f"Репорт перенаправлен ролям: {command.args}")
-    await message.answer("✅ Перенаправление репорта выполнено!")
-
-@dp.message(Command("muterep"))
-async def cmd_muterep(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
-    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
-    
-    days = int(command.args) if command.args and command.args.isdigit() else 3
-    until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    update_user(message.reply_to_message.from_user.id, rep_muted_until=until)
-    await message.answer(f"🔇 Использование /report заблокировано на {days} дней!")
-
-@dp.message(Command("bot_boost"))
-async def cmd_bot_boost(message: Message, command: CommandObject):
-    if not command.args:
-        return await message.answer("⚠️ Напишите идею улучшения: <code>/bot_boost Добавить больше игр</code>", parse_mode="HTML")
-    cursor.execute("INSERT INTO bot_boosts (user_id, text) VALUES (?, ?)", (message.from_user.id, command.args))
-    conn.commit()
-    await message.answer("💡 Ваша идея отправлена разработчикам! За отличные идеи полагаются награды.")
-
-@dp.message(Command("checkrep"))
-async def cmd_checkrep(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
-    cursor.execute("SELECT id, user_id, text FROM reports LIMIT 10")
-    rows = cursor.fetchall()
-    text = "📋 <b>АКТИВНЫЕ ЖАЛОБЫ И РЕПОРТЫ:</b>\n\n"
-    for r in rows: text += f"• ID:{r[0]} от {r[1]}: {r[2]}\n"
-    await message.answer(text, parse_mode="HTML")
-
-@dp.message(Command("checkboost"))
-async def cmd_checkboost(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
-    cursor.execute("SELECT id, user_id, text FROM bot_boosts LIMIT 10")
-    rows = cursor.fetchall()
-    text = "💡 <b>ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА:</b>\n\n"
-    for r in rows: text += f"• ID:{r[0]} от {r[1]}: {r[2]}\n"
-    await message.answer(text, parse_mode="HTML")
-
-@dp.message(Command("glist"))
-async def cmd_glist(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 9: return await message.answer("❌ Строго для 9+ рангов.")
-    cursor.execute("SELECT user_id, reason FROM global_bans")
-    rows = cursor.fetchall()
-    text = "🌐 <b>СПИСОК ГЛОБАЛЬНЫХ БАНОВ (GBAN):</b>\n\n"
-    for r in rows:
-        text += f"• Юзер ID: <code>{r[0]}</code> | Причина: {r[1]} [Для снятия: /ungban {r[0]}]\n"
-    await message.answer(text if rows else "Список GBAN пуст.", parse_mode="HTML")
-
-@dp.message(Command("gwlist"))
-async def cmd_gwlist(message: Message):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 9: return await message.answer("❌ Строго для 9+ рангов.")
-    cursor.execute("SELECT user_id, reason FROM global_warns")
-    rows = cursor.fetchall()
-    text = "⚠️ <b>СПИСОК ГЛОБАЛЬНЫХ ВАРНОВ (GWARN):</b>\n\n"
-    for r in rows:
-        text += f"• Юзер ID: <code>{r[0]}</code> | Причина: {r[1]} [Для снятия: /ungwarn {r[0]}]\n"
-    await message.answer(text if rows else "Список GWARN пуст.", parse_mode="HTML")
-
-@dp.message(Command("ungban"))
-async def cmd_ungban(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 10 and message.from_user.id != OWNER_ID:
-        return await message.answer("❌ Снятие GBAN строго для 10 ранга.")
-    if not command.args or not command.args.isdigit():
-        return await message.answer("⚠️ Укажите ID: <code>/ungban 123456789</code>", parse_mode="HTML")
-    
-    cursor.execute("DELETE FROM global_bans WHERE user_id = ?", (int(command.args),))
-    conn.commit()
-    await message.answer(f"✅ Пользователь ID {command.args} вынесен из GBAN!")
-
-@dp.message(Command("ungwarn"))
-async def cmd_ungwarn(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 9: return await message.answer("❌ Доступно для 9+ ранга.")
-    if not command.args or not command.args.isdigit():
-        return await message.answer("⚠️ Укажите ID: <code>/ungwarn 123456789</code>", parse_mode="HTML")
-    
-    cursor.execute("DELETE FROM global_warns WHERE user_id = ?", (int(command.args),))
-    conn.commit()
-    await message.answer(f"✅ GWARN с пользователя ID {command.args} снят!")
-
-@dp.message(Command("pleasevip"))
-async def cmd_pleasevip(message: Message):
-    uid = message.from_user.id
-    cursor.execute("SELECT 1 FROM user_roles_owned WHERE user_id = ? AND role_id = -888", (uid,))
-    if cursor.fetchone():
-        return await message.answer("❌ Вы уже просили бесплатную VIP-ку через /pleasevip!")
-    
-    v_until = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
-    update_user(uid, vip_until=v_until)
-    cursor.execute("INSERT INTO user_roles_owned VALUES (?, -888)", (uid,))
-    conn.commit()
-    await message.answer("🎉 Вам бесплатно одобрен <b>VIP на 5 дней</b>!", parse_mode="HTML")
-
-@dp.message(Command("givesvips"))
-async def cmd_givesvips(message: Message, command: CommandObject):
-    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    if user[3] < 10 and message.from_user.id != OWNER_ID:
-        return await message.answer("❌ Выдача VIP строго от 10 ранга.")
-    if not command.args:
-        return await message.answer("⚠️ Использование: <code>/givesvips @username 1</code> (месяцев)", parse_mode="HTML")
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 7 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Доступно с 7+ ранга.")
+    if not command.args or len(command.args.split()) < 2:
+        return await message.answer("⚠️ Использование: <code>/setaccess @username [ранг 0-10]</code>", parse_mode="HTML")
     
     parts = command.args.split()
     target_uname = clean_username(parts[0])
-    months = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-    
-    target = get_user(username=target_uname)
-    if not target: return await message.answer("❌ Пользователь не найден в БД бота!")
-    
-    add_vip_time(target[0], str(months))
-    await message.answer(f"✅ Пользователю @{target_uname} выдан VIP на {months} мес.!")
+    new_rank = int(parts[1]) if parts[1].isdigit() else 0
 
-@dp.message(Command("Global"))
-async def cmd_global_news(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID and (not message.from_user.username or message.from_user.username.lower() != OWNER_USERNAME.lower()):
-        return await message.answer("❌ Эта команда доступна исключительно Владельцу бота!")
+    target = get_user(username=target_uname)
+    if target:
+        update_user(target[0], rank=new_rank)
+        await message.answer(f"✅ Пользователю @{target_uname} установлен ранг доступа: <b>{new_rank}</b>", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Пользователь @{target_uname} не найден.")
+
+@dp.message(Command("giverang"))
+async def cmd_giverang(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 7 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Доступно с 7+ ранга.")
+    if not command.args or len(command.args.split()) < 2:
+        return await message.answer("⚠️ Использование: <code>/giverang @username [название роли/ранга]</code>", parse_mode="HTML")
     
-    if command.args and command.args.startswith("news"):
-        rules_text = command.args[4:].strip()
-        cursor.execute("INSERT OR REPLACE INTO chat_settings (chat_id, rules) VALUES (?, ?)", (message.chat.id, rules_text))
-        conn.commit()
-        await message.answer(f"📜 <b>ГЛОБАЛЬНЫЕ ПРАВИЛА ЧАТА ОБНОВЛЕНЫ:</b>\n{rules_text}", parse_mode="HTML")
+    parts = command.args.split(maxsplit=1)
+    target_uname = clean_username(parts[0])
+    role_name = parts[1]
+
+    if set_role(target_uname, role_name):
+        await message.answer(f"✅ Пользователю @{target_uname} присвоен ранг/роль: <b>{role_name}</b>", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Пользователь @{target_uname} не найден.")
+
+@dp.message(Command("ungiverang"))
+async def cmd_ungiverang(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 7 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Доступно с 7+ ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/ungiverang @username</code>", parse_mode="HTML")
+    
+    target_uname = clean_username(command.args)
+    if set_role(target_uname, "User"):
+        target = get_user(username=target_uname)
+        if target: update_user(target[0], rank=0)
+        await message.answer(f"✅ С пользователя @{target_uname} снят административный ранг.", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Пользователь @{target_uname} не найден.")
+
+@dp.message(Command("setzam"))
+async def cmd_setzam(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 9 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Доступно с 9+ ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/setzam @username</code>", parse_mode="HTML")
+    
+    target_uname = clean_username(command.args)
+    target = get_user(username=target_uname)
+    if target:
+        update_user(target[0], rank=9, role="Заместитель")
+        await message.answer(f"👑 Пользователь @{target_uname} назначен **Заместителем Владельца**!", parse_mode="Markdown")
+    else:
+        await message.answer(f"❌ Пользователь @{target_uname} не найден.")
+
+@dp.message(Command("unsetzam"))
+async def cmd_unsetzam(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 9 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Доступно с 9+ ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/unsetzam @username</code>", parse_mode="HTML")
+    
+    target_uname = clean_username(command.args)
+    target = get_user(username=target_uname)
+    if target:
+        update_user(target[0], rank=0, role="User")
+        await message.answer(f"✅ Пользователь @{target_uname} снят с должности Заместителя.", parse_mode="Markdown")
+    else:
+        await message.answer(f"❌ Пользователь @{target_uname} не найден.")
 
 # ==========================================
-# 12. ЗАПУСК БОТА
+# 12. ВЫСШИЕ АДМИН-КОМАНДЫ И РЕЕСТРЫ
+# ==========================================
+
+@dp.message(Command("repgh"))
+async def cmd_repgh(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    if not command.args or len(command.args.split()) < 2:
+        return await message.answer("⚠️ Использование: <code>/repgh @username [кол-во]</code>", parse_mode="HTML")
+    
+    parts = command.args.split()
+    target_uname = clean_username(parts[0])
+    val = int(parts[1]) if parts[1].lstrip('-').isdigit() else 0
+    
+    target = get_user(username=target_uname)
+    if target:
+        update_user(target[0], rep=target[8] + val)
+        await message.answer(f"⭐ Репутация @{target_uname} изменена на {val}. (Итого: {target[8] + val})")
+    else:
+        await message.answer("❌ Пользователь не найден.")
+
+@dp.message(Command("muterep"))
+async def cmd_muterep(message: Message):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 8: return await message.answer("❌ Доступно с 8+ ранга.")
+    if not message.reply_to_message: return await message.answer("⚠️ Ответьте на сообщение!")
+    
+    tid = message.reply_to_message.from_user.id
+    until = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    update_user(tid, rep_muted_until=until)
+    await message.answer("🔇 Пользователю заблокирована возможность изменять репутацию на 7 дней.")
+
+@dp.message(Command("bot_boost"))
+async def cmd_bot_boost(message: Message, command: CommandObject):
+    if not command.args: return await message.answer("⚠️ Укажите текст отзыва/буста.")
+    cursor.execute("INSERT INTO bot_boosts (user_id, text) VALUES (?, ?)", (message.from_user.id, command.args))
+    conn.commit()
+    await message.answer("🚀 Спасибо! Ваш отзыв о бусте бота принят.")
+
+@dp.message(Command("checkrep"))
+async def cmd_checkrep(message: Message):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 8: return
+    await message.answer(f"📊 Доступ к изменению репутации заблокирован у выбранных пользователей по лимитам системы.")
+
+@dp.message(Command("checkboost"))
+async def cmd_checkboost(message: Message):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 8: return
+    cursor.execute("SELECT user_id, text FROM bot_boosts LIMIT 10")
+    rows = cursor.fetchall()
+    text = "🚀 <b>СБОР БУСТОВ И ОТЗЫВОВ:</b>\n\n"
+    for r in rows:
+        text += f"• User {r[0]}: {r[1]}\n"
+    await message.answer(text if rows else "Бустов пока нет.", parse_mode="HTML")
+
+@dp.message(Command("glist"))
+async def cmd_glist(message: Message):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 6: return
+    cursor.execute("SELECT user_id, reason, by_user FROM global_bans")
+    rows = cursor.fetchall()
+    text = "🌐 <b>СПИСОК ГЛОБАЛЬНЫХ БАНОВ (GBAN):</b>\n\n"
+    for r in rows:
+        text += f"• ID: <code>{r[0]}</code> | Причина: {r[1]} | От: @{r[2]}\n"
+    await message.answer(text if rows else "Глобальных банов нет.", parse_mode="HTML")
+
+@dp.message(Command("gwlist"))
+async def cmd_gwlist(message: Message):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 6: return
+    cursor.execute("SELECT user_id, reason, by_user FROM global_warns")
+    rows = cursor.fetchall()
+    text = "🌐 <b>СПИСОК ГЛОБАЛЬНЫХ ВАРНОВ (GWARN):</b>\n\n"
+    for r in rows:
+        text += f"• ID: <code>{r[0]}</code> | Причина: {r[1]} | От: @{r[2]}\n"
+    await message.answer(text if rows else "Глобальных варнов нет.", parse_mode="HTML")
+
+@dp.message(Command("ungban"))
+async def cmd_ungban(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 6: return
+    if not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Укажите ID: <code>/ungban 12345678</code>", parse_mode="HTML")
+    
+    tid = int(command.args)
+    cursor.execute("DELETE FROM global_bans WHERE user_id = ?", (tid,))
+    conn.commit()
+    await message.answer(f"✅ Пользователь <code>{tid}</code> вынесен из реестра GBAN!", parse_mode="HTML")
+
+@dp.message(Command("ungwarn"))
+async def cmd_ungwarn(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 6: return
+    if not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Укажите ID: <code>/ungwarn 12345678</code>", parse_mode="HTML")
+    
+    tid = int(command.args)
+    cursor.execute("DELETE FROM global_warns WHERE user_id = ?", (tid,))
+    conn.commit()
+    await message.answer(f"✅ Пользователь <code>{tid}</code> вынесен из реестра GWARN!", parse_mode="HTML")
+
+@dp.message(Command("Global_news"), Command("Global news"))
+async def cmd_global_news(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if user[3] < 9 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Рассылка новостей доступна с 9+ ранга.")
+    if not command.args:
+        return await message.answer("⚠️ Введите текст новости: <code>/Global news Внимание всем чатам!</code>", parse_mode="HTML")
+    
+    cursor.execute("SELECT chat_id FROM known_chats")
+    chats = cursor.fetchall()
+    
+    success = 0
+    for ch in chats:
+        try:
+            await bot.send_message(ch[0], f"📢 <b>ГЛОБАЛЬНАЯ НОВОСТЬ СЕТИ:</b>\n\n{command.args}", parse_mode="HTML")
+            success += 1
+        except Exception:
+            pass
+            
+    await message.answer(f"✅ Новость успешно отправлена в <b>{success}</b> чатов!", parse_mode="HTML")
+
+# ==========================================
+# 13. ЗАПУСК БОТА
 # ==========================================
 
 async def main():
-    print("🚀 Объединенный Stars Manager Bot успешно запущен!")
+    print("🚀 Bot is launching...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
