@@ -26,7 +26,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ==========================================
-# 0. ВЕБ-СЕРВЕР ДЛЯ РАЗВЕРТЫВАНИЯ (RENDER/REPLIT 24/7)
+# 0. ВЕБ-СЕРВЕР ДЛЯ РАЗВЕРТЫВАНИЯ (24/7)
 # ==========================================
 app = Flask('')
 
@@ -60,14 +60,13 @@ MONOBANK_JAR = "https://send.monobank.ua/jar/8wVnXzoF3f"
 CARD_DETAILS = "4441 0000 0000 0000"
 OWNER_USERNAME = "nlyxx2686"
 OWNER_ID = 123456789  # Укажите ваш настоящий Telegram ID
-ADMIN_IDS = [123456789]  # Список ID администраторов
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # ==========================================
-# 2. ИНИЦИАЛИЗАЦИЯ И РАБОТА С БАЗОЙ ДАННЫХ
+# 2. БАЗА ДАННЫХ И ИНИЦИАЛИЗАЦИЯ
 # ==========================================
 def clean_username(username: str) -> str:
     if not username:
@@ -301,7 +300,7 @@ MONEY_PACKS_STARS = {
     "5000": {"coins": 5000, "price": 85, "text": "5,000 монет — 85 Stars ⭐️"},
     "10000": {"coins": 10000, "price": 150, "text": "10,000 монет — 150 Stars ⭐️"},
     "15000": {"coins": 15000, "price": 200, "text": "15,000 монет — 200 Stars ⭐️"},
-    "20000": {"coins": 20000, "price": 245, "text": "20,000 монет — 245 Stars ⭐️"},
+    "20000": {"coins": 20000, "price": 245, "text": "20,000 монет — 245 Stars ⭐️️"},
 }
 
 # ==========================================
@@ -336,7 +335,7 @@ async def global_middleware(handler, event: Message, data):
     return await handler(event, data)
 
 # ==========================================
-# 5. ОСНОВНЫЕ И ИГРОВЫЕ КОМАНДЫ
+# 5. ОСНОВНЫЕ И ЭКОНОМИЧЕСКИЕ КОМАНДЫ
 # ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
@@ -348,7 +347,6 @@ async def cmd_start(message: Message, command: CommandObject):
 
     user = await get_user(user_id, username)
 
-    # Реферальная система
     if command.args and command.args.isdigit():
         ref_id = int(command.args)
         if ref_id != user_id and user['referrer_id'] is None:
@@ -393,6 +391,7 @@ async def cmd_profile(message: Message):
             f"🪙 Баланс: {user['coins']} монет\n"
             f"⚡ Уровень: {user['level']} ({user['exp']} EXP)\n"
             f"🔰 Админ-ранг: {user['rank']}\n"
+            f"⚠️ Предупреждений (варны): {user['warns']}/3\n"
             f"⭐ VIP-статус: {vip_str}\n"
             f"🏆 Репутация: {user['rep']}\n"
             f"💬 Сообщений: {user['msg_count']} | ⚔️ Побед в дуэлях: {user['duel_wins']}",
@@ -404,7 +403,7 @@ async def cmd_profile(message: Message):
 @dp.message(Command("rep"))
 async def cmd_rep(message: Message, command: CommandObject):
     if not message.reply_to_message or message.reply_to_message.from_user.is_bot:
-        return await message.answer("⚠️️ Ответьте на сообщение пользователя.")
+        return await message.answer("⚠ Ответьте на сообщение пользователя.")
     
     target_id = message.reply_to_message.from_user.id
     sender_id = message.from_user.id
@@ -412,8 +411,17 @@ async def cmd_rep(message: Message, command: CommandObject):
         return await message.answer("❌ Нельзя изменять репутацию самому себе!")
 
     sender = await get_user(user_id=sender_id, username=message.from_user.username or "")
-    now_str = datetime.now().strftime("%Y-%m-%d")
     
+    # Проверка блокировки репутации
+    if sender['rep_muted_until']:
+        try:
+            until = datetime.strptime(sender['rep_muted_until'], "%Y-%m-%d %H:%M:%S")
+            if datetime.now() < until:
+                return await message.answer(f"❌ Ваша возможность менять репутацию заблокирована до {sender['rep_muted_until']}!")
+        except Exception:
+            pass
+
+    now_str = datetime.now().strftime("%Y-%m-%d")
     max_rep_count = 3 if is_vip(sender) else 1
     today_count = sender['rep_given_today'] if sender['last_rep_date'] == now_str else 0
     
@@ -533,7 +541,7 @@ async def cmd_transfer(message: Message, command: CommandObject):
     await message.answer(f"💸 Успешно переведено <b>{amount} монет</b> пользователю {message.reply_to_message.from_user.full_name}!", parse_mode="HTML")
 
 # ==========================================
-# 6. МОДЕРАЦИЯ И АДМИНИСТРИРОВАНИЕ
+# 6. ПОЛНАЯ СИСТЕМА МОДЕРАЦИИ И БАНОВ
 # ==========================================
 @dp.message(Command("mute"))
 async def cmd_mute(message: Message, command: CommandObject):
@@ -569,11 +577,178 @@ async def cmd_unmute(message: Message):
     try:
         await message.chat.restrict(
             user_id=message.reply_to_message.from_user.id,
-            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
         )
         await message.answer(f"🔊 С пользователя {message.reply_to_message.from_user.full_name} сняты ограничения.")
     except Exception as e:
         await message.answer(f"❌ Не удалось снять мут: {e}")
+
+@dp.message(Command("kick"))
+async def cmd_kick(message: Message):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 3:
+        return await message.answer("❌ Кик доступен с 3+ ранга.")
+    
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение пользователя для кика.")
+        
+    target_id = message.reply_to_message.from_user.id
+    try:
+        await message.chat.ban(user_id=target_id)
+        await message.chat.unban(user_id=target_id)
+        await message.answer(f"🚪 Пользователь {message.reply_to_message.from_user.full_name} исключен из чата!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при кике: {e}")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 4:
+        return await message.answer("❌ Бан доступен с 4+ ранга.")
+        
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение пользователя.")
+        
+    target_id = message.reply_to_message.from_user.id
+    reason = command.args if command and command.args else "Нарушение правил"
+    
+    try:
+        await message.chat.ban(user_id=target_id)
+        await message.answer(f"⛔ Игрок {message.reply_to_message.from_user.full_name} забанен в чате!\nПричина: {reason}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при выдаче бана: {e}")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 4:
+        return await message.answer("❌ Разбан доступен с 4+ ранга.")
+        
+    if not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Укажите Telegram ID пользователя: <code>/unban 123456789</code>", parse_mode="HTML")
+        
+    target_id = int(command.args)
+    try:
+        await message.chat.unban(user_id=target_id)
+        await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> разбанен!", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка разбана: {e}")
+
+@dp.message(Command("warn"))
+async def cmd_warn(message: Message, command: CommandObject):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 3:
+        return await message.answer("❌ Выдача варнов доступна с 3+ ранга.")
+        
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение нарушителя.")
+        
+    target_id = message.reply_to_message.from_user.id
+    target = await get_user(user_id=target_id, username=message.reply_to_message.from_user.username or "")
+    
+    new_warns = target['warns'] + 1
+    reason = command.args if command and command.args else "Без причины"
+    
+    if new_warns >= 3:
+        await update_user(target_id, warns=0)
+        try:
+            await message.chat.ban(user_id=target_id)
+            await message.answer(f"⚠️ Пользователь {message.reply_to_message.from_user.full_name} получил 3/3 варнов и забанен!")
+        except Exception:
+            await message.answer(f"⚠️ У пользователя 3/3 варнов, но не удалось забанить из-за прав бота.")
+    else:
+        await update_user(target_id, warns=new_warns)
+        await message.answer(f"⚠️ Пользователю {message.reply_to_message.from_user.full_name} выдан варн ({new_warns}/3).\nПричина: {reason}")
+
+@dp.message(Command("unwarn"))
+async def cmd_unwarn(message: Message):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 3:
+        return await message.answer("❌ Снятие варнов доступно с 3+ ранга.")
+        
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение пользователя.")
+        
+    target_id = message.reply_to_message.from_user.id
+    target = await get_user(user_id=target_id)
+    
+    if target['warns'] <= 0:
+        return await message.answer("ℹ️ У пользователя нет активных предупреждений.")
+        
+    new_warns = target['warns'] - 1
+    await update_user(target_id, warns=new_warns)
+    await message.answer(f"✅ С пользователя {message.reply_to_message.from_user.full_name} снят 1 варн. Осталось: {new_warns}/3")
+
+@dp.message(Command("rep_mute"))
+async def cmd_rep_mute(message: Message, command: CommandObject):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 5:
+        return await message.answer("❌ Команда доступна с 5+ ранга.")
+        
+    if not message.reply_to_message or not command.args or not command.args.isdigit():
+        return await message.answer("⚠️ Ответьте на сообщение и укажите дни: <code>/rep_mute 7</code>", parse_mode="HTML")
+        
+    days = int(command.args)
+    until = datetime.now() + timedelta(days=days)
+    until_str = until.strftime("%Y-%m-%d %H:%M:%S")
+    
+    target_id = message.reply_to_message.from_user.id
+    await update_user(target_id, rep_muted_until=until_str)
+    await message.answer(f"🔇 Пользователю {message.reply_to_message.from_user.full_name} заблокирована передача репутации на {days} дней.")
+
+@dp.message(Command("gban"))
+async def cmd_gban(message: Message, command: CommandObject):
+    user = await get_user(message.from_user.id)
+    if user['rank'] < 9 and message.from_user.id != OWNER_ID:
+        return await message.answer("❌ Глобальный бан доступен только Главной Администрации (9+ ранг).")
+        
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/gban [ID/User] [Причина]</code>", parse_mode="HTML")
+        
+    parts = command.args.split(maxsplit=1)
+    target_str = parts[0]
+    reason = parts[1] if len(parts) > 1 else "Глобальное нарушение"
+    
+    target_user = None
+    if target_str.isdigit():
+        target_user = await get_user(user_id=int(target_str))
+    else:
+        target_user = await get_user(username=target_str)
+        
+    if not target_user:
+        return await message.answer("❌ Пользователь не найден в базе данных.")
+        
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO global_bans (user_id, reason, by_user) VALUES (?, ?, ?)", 
+                         (target_user['user_id'], reason, message.from_user.username or str(message.from_user.id)))
+        await db.commit()
+        
+    await message.answer(f"🚨 Пользователь <code>{target_user['user_id']}</code> внесен в **ГЛОБАЛЬНЫЙ БАН**!\nПричина: {reason}", parse_mode="HTML")
+
+# ==========================================
+# 7. РЕПОРТЫ И АДМИНИСТРИРОВАНИЕ
+# ==========================================
+@dp.message(Command("report"))
+async def cmd_report(message: Message, command: CommandObject):
+    if not message.reply_to_message:
+        return await message.answer("⚠️ Ответьте на сообщение нарушителя с текстом жалобы.")
+        
+    reason = command.args if command and command.args else "Без причины"
+    target_id = message.reply_to_message.from_user.id
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO reports (chat_id, user_id, target_id, text) VALUES (?, ?, ?, ?)",
+            (message.chat.id, message.from_user.id, target_id, reason)
+        )
+        await db.commit()
+        
+    await message.answer("✅ Ваша жалоба отправлена администрации чата!")
 
 @dp.message(Command("setadmin"))
 async def cmd_setadmin(message: Message, command: CommandObject):
@@ -626,7 +801,7 @@ async def cmd_give_money(message: Message, command: CommandObject):
     target_username = clean_username(parts[0])
     
     if not parts[1].isdigit():
-        return await message.answer("⚠️️ Укажите число монет цифрами.")
+        return await message.answer("⚠ Укажите число монет цифрами.")
         
     amount = int(parts[1])
     row = await get_user(username=target_username)
@@ -642,7 +817,7 @@ async def cmd_give_money(message: Message, command: CommandObject):
     await message.answer(f"✅ Успешно выдано <b>{amount} монет</b> пользователю @{target_username}! (Новый баланс: {new_coins})", parse_mode="HTML")
 
 # ==========================================
-# 7. КАСТОМНЫЕ РОЛИ И МАГАЗИН
+# 8. КАСТОМНЫЕ РОЛИ И МАГАЗИН
 # ==========================================
 @dp.message(Command("create_role"))
 async def cmd_create_role(message: Message, command: CommandObject):
@@ -651,7 +826,7 @@ async def cmd_create_role(message: Message, command: CommandObject):
         return await message.answer("❌ Создание ролей доступно с 5+ ранга.")
         
     if not command.args:
-        return await message.answer("⚠️ Использование: <code>/create_role [Текст роли] [#HEX_цвет] [Цена]</code>", parse_mode="HTML")
+        return await message.answer("⚠️️ Использование: <code>/create_role [Текст роли] [#HEX_цвет] [Цена]</code>", parse_mode="HTML")
     
     pattern = r"\[(.*?)\]\s*\[(.*?)\]\s*\[(\d+)\]"
     match = re.search(pattern, command.args)
@@ -671,13 +846,19 @@ async def cmd_create_role(message: Message, command: CommandObject):
     await message.answer(f"✅ Кастомная роль <b>{text}</b> создана и добавлена в магазин (/role_shop)!", parse_mode="HTML")
 
 @dp.message(Command("role_shop", "shop"))
-async def cmd_role_shop(message: Message):
+@dp.callback_query(F.data == "open_shop")
+async def cmd_role_shop(event: Message | CallbackQuery):
+    chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
+    
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT role_id, text, color_code, price FROM custom_roles WHERE chat_id = ?", (message.chat.id,)) as cursor:
+        async with db.execute("SELECT role_id, text, color_code, price FROM custom_roles WHERE chat_id = ?", (chat_id,)) as cursor:
             roles = await cursor.fetchall()
             
     if not roles:
-        return await message.answer("🛍 В этом чате пока нет кастомных ролей.")
+        msg_text = "🛍 В этом чате пока нет кастомных ролей."
+        if isinstance(event, CallbackQuery):
+            return await event.message.answer(msg_text)
+        return await event.answer(msg_text)
         
     text = "🛍 <b>Магазин кастомных ролей чата:</b>\n\n"
     kb = InlineKeyboardBuilder()
@@ -688,7 +869,11 @@ async def cmd_role_shop(message: Message):
         kb.button(text=f"Купить: {r_text}", callback_data=f"buy_role_{role_id}")
         
     kb.adjust(1)
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("buy_role_"))
 async def process_buy_role(callback: CallbackQuery):
@@ -711,15 +896,15 @@ async def process_buy_role(callback: CallbackQuery):
     await callback.message.answer(f"✅ Пользователь @{callback.from_user.username} приобрел роль <b>{r_text}</b>!", parse_mode="HTML")
 
 # ==========================================
-# 8. TELEGRAM STARS И ОПЛАТА ДОНАТОВ
+# 9. TELEGRAM STARS И ОПЛАТА ДОНАТОВ
 # ==========================================
 @dp.callback_query(F.data == "open_donate")
 @dp.message(Command("vip"))
 async def cmd_vip(event: Message | CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 VIP за ГРН", callback_data="buy_vip_uah")],
+        [InlineKeyboardButton(text="💳 VIP за ГРН (Банка / Карта)", callback_data="buy_vip_uah")],
         [InlineKeyboardButton(text="⭐️ VIP за TG Stars", callback_data="buy_vip_stars")],
-        [InlineKeyboardButton(text="💰 Купить монеты", callback_data="buy_money_menu")],
+        [InlineKeyboardButton(text="💰 Купить монеты (Stars)", callback_data="buy_money_stars")],
         [InlineKeyboardButton(text="❤️ Поддержать проект (/blago)", callback_data="blago_menu")]
     ])
     text = "✨ <b>Выберите категорию доната или покупки:</b>"
@@ -750,6 +935,30 @@ async def process_stars_selection(callback: CallbackQuery):
         title=title,
         description=f"Активация VIP-статуса в боте: {info['text']}",
         payload=f"stars_vip_{period}",
+        currency="XTR",
+        prices=prices
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "buy_money_stars")
+async def process_money_stars_menu(callback: CallbackQuery):
+    buttons = []
+    for key, data in MONEY_PACKS_STARS.items():
+        buttons.append([InlineKeyboardButton(text=data["text"], callback_data=f"buy_coins_stars_{key}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="open_donate")])
+    await callback.message.edit_text("💰 <b>Выберите пак монет (Оплата TG Stars):</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("buy_coins_stars_"))
+async def process_coins_stars_selection(callback: CallbackQuery):
+    key = callback.data.split("_")[3]
+    info = MONEY_PACKS_STARS[key]
+
+    prices = [LabeledPrice(label="Монеты", amount=info["price"])]
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Пак монет ({info['coins']})",
+        description=f"Покупка игровых монет: {info['text']}",
+        payload=f"buy_coins_{info['coins']}",
         currency="XTR",
         prices=prices
     )
@@ -789,8 +998,39 @@ async def successful_payment_handler(message: Message):
         await add_donat_record(user.id, username, "Покупка монет", f"+{coins_amt} монет", f"{payment.total_amount} Stars")
         await message.answer(f"🎉 <b>Оплата прошла успешно!</b>\nВам начислено <b>{coins_amt} монет</b>.", parse_mode="HTML")
 
+# Оплата по реквизитам (UAH / Monobank)
+@dp.callback_query(F.data == "buy_vip_uah")
+async def process_vip_uah_menu(callback: CallbackQuery):
+    text = (
+        "💳 <b>Оплата VIP через Банку / Карту (ГРН):</b>\n\n"
+        f"🔗 <b>Банка Monobank:</b> {MONOBANK_JAR}\n"
+        f"💳 <b>Карта:</b> <code>{CARD_DETAILS}</code>\n\n"
+        "<b>Прайс-лист:</b>\n"
+    )
+    for k, v in PRICES_UAH.items():
+        text += f"• {v['text']}\n"
+        
+    text += f"\n📌 После оплаты отправьте чек или скриншот Владельцу: @{OWNER_USERNAME}"
+    await callback.message.edit_text(text, parse_mode="HTML")
+
+@dp.callback_query(F.data == "blago_menu")
+@dp.message(Command("blago"))
+async def cmd_blago(event: Message | CallbackQuery):
+    text = (
+        "❤️ <b>Благотворительность и поддержка бота:</b>\n\n"
+        "Все собранные средства идут на оплату серверов 24/7 и развитие бота.\n\n"
+        f"🔗 <b>Monobank Банка:</b> {MONOBANK_JAR}\n"
+        f"💳 <b>Карта:</b> <code>{CARD_DETAILS}</code>\n"
+        "⭐️ Или отправьте Stars через команду в Telegram."
+    )
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(text, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, parse_mode="HTML")
+
 # ==========================================
-# 9. РАССЫЛКА И МАССОВЫЕ УВЕДОМЛЕНИЯ
+# 10. РАССЫЛКА И МАССОВЫЕ УВЕДОМЛЕНИЯ
 # ==========================================
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, state: FSMContext):
@@ -822,7 +1062,7 @@ async def process_broadcast_text(message: Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена! Сообщение получили {count} пользователей.")
 
 # ==========================================
-# 10. ЛОГИ И ИНФОРМАЦИЯ (/help, /books)
+# 11. ЛОГИ И СПРАВКА (/help, /books, /book_global)
 # ==========================================
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -833,21 +1073,28 @@ async def cmd_help(message: Message):
         "📜 <b>ПОЛНЫЙ СПИСОК КОМАНД БОТА</b>\n\n"
         "<b>🌍 1. Основные & Экономика & VIP:</b>\n"
         "• <code>/profile [@username]</code> — Просмотр профиля\n"
-        "• <code>/vip</code> — Купить VIP-статус\n"
-        "• <code>/bonus</code> — Ежедневный бонус\n"
-        "• <code>/top</code> — Топ по монетам\n"
-        "• <code>/duel [ставка]</code> — Дуэль на монеты\n"
-        "• <code>/transfer [user] [кол-во]</code> — Перевод монет\n\n"
-        "<b>🛡️ 2. Модерация:</b>\n"
-        "• <code>/mute [мин]</code>, <code>/unmute</code> — Мут/Размут\n"
+        "• <code>/vip</code> — Купить VIP-статус / Монеты\n"
+        "• <code>/bonus</code> — Ежедневный бонус за активность\n"
+        "• <code>/top</code> — Топ игроков по монетам\n"
+        "• <code>/duel [ставка]</code> — Дуэль с игроком\n"
+        "• <code>/transfer [user] [кол-во]</code> — Перевод монет\n"
+        "• <code>/report [текст]</code> — Пожаловаться на сообщение\n\n"
+        "<b>🛡️ 2. Модерация (3+ ранг):</b>\n"
+        "• <code>/mute [мин]</code>, <code>/unmute</code> — Выдать/снять мут\n"
+        "• <code>/kick</code> — Исключить из чата\n"
+        "• <code>/ban [причина]</code>, <code>/unban [ID]</code> — Бан/Разбан\n"
+        "• <code>/warn [причина]</code>, <code>/unwarn</code> — Выдать/снять варн\n"
     )
-    if rank >= 3:
+    if rank >= 5:
         text += (
-            "\n<b>👑 3. Руководство:</b>\n"
-            "• <code>/setadmin @username</code> — Выдать права админа\n"
-            "• <code>/setrank [ID] [Ранг]</code> — Выдать ранг\n"
+            "\n<b>👑 3. Руководство и Владелец (5+ ранг):</b>\n"
+            "• <code>/rep_mute [дни]</code> — Блок передачи репутации\n"
+            "• <code>/create_role [...]</code> — Создать роль в магазин\n"
+            "• <code>/setadmin @username</code> — Назначить админа\n"
+            "• <code>/setrank [ID] [Ранг]</code> — Выдать ранг (1-10)\n"
+            "• <code>/gban [ID] [Причина]</code> — Глобальный бан\n"
             "• <code>/give_money @username [кол-во]</code> — Выдать монеты\n"
-            "• <code>/broadcast</code> — Массовая рассылка\n"
+            "• <code>/broadcast</code> — Рассылка по базе\n"
             "• <code>/books</code>, <code>/book_global</code> — Системные логи\n"
         )
     await message.answer(text, parse_mode="HTML")
@@ -860,7 +1107,7 @@ async def cmd_books(message: Message):
     
     await send_log_to_user(
         message.from_user.id, 
-        f"📊 <b>РАСШИРЕННЫЙ ЛОГ ГРУППЫ {message.chat.title} ({message.chat.id}):</b>\nВсе системы работают штатно."
+        f"📊 <b>РАСШИРЕННЫЙ ЛОГ ГРУППЫ {message.chat.title} ({message.chat.id}):</b>\nВсе системы модерации и экономики работают штатно."
     )
     await message.answer("📖 Расширенные логи успешно отправлены вам в ЛС!")
 
@@ -886,7 +1133,7 @@ async def cmd_book_global(message: Message):
     await message.answer("🌐 Глобальный лог отправлен в ЛС!")
 
 # ==========================================
-# 11. ЗАПУСК БОТА (MAIN LOOP)
+# 12. ЗАПУСК БОТА (MAIN LOOP)
 # ==========================================
 async def main():
     await init_db()
