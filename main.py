@@ -414,6 +414,58 @@ async def cmd_setadmin(message: Message):
     else:
         await message.answer(f"❌ Пользователь **{target_username.replace('@', '')}** не найден в базе. Пусть сначала напишет `/start` боту.", parse_mode="Markdown")
 
+@dp.message(Command("id"))
+async def cmd_id(message: Message, command: CommandObject):
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        return await message.answer(
+            f"👤 <b>Пользователь:</b> @{target_user.username or 'без_юзернейма'}\n"
+            f"🆔 <b>ID:</b> <code>{target_user.id}</code>",
+            parse_mode="HTML"
+        )
+
+    if command.args:
+        target_username = clean_username(command.args)
+        user_row = get_user(username=target_username)
+
+        if user_row:
+            await message.answer(
+                f"👤 <b>Пользователь:</b> @{target_username}\n"
+                f"🆔 <b>ID:</b> <code>{user_row[0]}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(
+                f"❌ Пользователь <b>@{target_username}</b> не найден в базе данных бота.",
+                parse_mode="HTML"
+            )
+        return
+
+    await message.answer(
+        f"👤 <b>Ваш профиль:</b> @{message.from_user.username or 'без_юзернейма'}\n"
+        f"🆔 <b>Ваш ID:</b> <code>{message.from_user.id}</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("nonick"))
+async def cmd_nonick(message: Message):
+    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
+    if user[3] < 2:
+        return await message.answer("❌ Команда доступна с 2+ ранга модерации.")
+    
+    cursor.execute("SELECT user_id, username FROM users WHERE custom_nickname IS NULL OR custom_nickname = '' LIMIT 25")
+    rows = cursor.fetchall()
+    
+    if not rows:
+        return await message.answer("✅ В базе данных нет пользователей без кастомного ника.")
+    
+    text = "👥 <b>Список пользователей без кастомного ника:</b>\n\n"
+    for r in rows:
+        uname = f"@{r[1]}" if r[1] else f"ID:{r[0]}"
+        text += f"• {uname} (ID: <code>{r[0]}</code>)\n"
+        
+    await message.answer(text, parse_mode="HTML")
+
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
@@ -423,6 +475,7 @@ async def cmd_help(message: Message):
         "📜 <b>ПОЛНЫЙ СПИСОК КОМАНД БОТА</b>\n\n"
         "<b>🌍 1. Основные & Экономика & VIP & Донаты:</b>\n"
         "• <code>/profile [@username]</code> — Просмотр профиля по юзернейму\n"
+        "• <code>/id [@username]</code> — Узнать Telegram ID пользователя\n"
         "• <code>/vip</code> — Купить VIP-статус (Гривны / TG Stars)\n"
         "• <code>/buy_money</code> — Купить монеты (Гривны / TG Stars)\n"
         "• <code>/blago</code> — Поддержка команды бота (Произвольный донат)\n"
@@ -441,6 +494,7 @@ async def cmd_help(message: Message):
         "• <code>/report [текст]</code> — Жалоба администрации\n\n"
         "<b>🛡️ 2. Модерация (1-6 Ранги):</b>\n"
         "• <code>/snick</code>, <code>/rnick</code>, <code>/gnick</code> — Управление никами (2+)\n"
+        "• <code>/nonick</code> — Список пользователей без кастомного ника (2+)\n"
         "• <code>/staff</code> — Модерация онлайн (1+)\n"
         "• <code>/warn</code>, <code>/mute</code>, <code>/kick</code>, <code>/ban</code> (4+)\n"
         "• <code>/skick</code> — Кик со всех групп\n"
@@ -874,7 +928,7 @@ async def blago_stars_process(message: Message, state: FSMContext):
 async def cmd_buy_money(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Оплата в ГРН", callback_data="buy_money_uah")],
-        [InlineKeyboardButton(text="⭐️️ Оплата в TG Stars", callback_data="buy_money_stars")]
+        [InlineKeyboardButton(text="⭐ Оплата в TG Stars", callback_data="buy_money_stars")]
     ])
     await message.answer("💰 <b>ПОКУПКА ИГРОВЫХ МОНЕТ</b>\nВыберите способ оплаты:", reply_markup=kb, parse_mode="HTML")
 
@@ -922,8 +976,8 @@ async def process_buy_m_uah(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"💳 <b>Покупка монет ({pack['coins']} монет)</b>\n\n"
-        f"Переведите <b>{pack['price']} грн</b> на банку/карту:\n"
-        f"🔗 Ссылка: {MONOBANK_JAR}\n<code>{CARD_DETAILS}</code>\n\n"
+        f"Переведите <b>{pack['price']} грн</b> на банку:\n"
+        f"🔗 Ссылка: {MONOBANK_JAR}\n\n"
         f"📌 <b>ОБЯЗАТЕЛЬНО</b> при переводе или после нажмите кнопку ниже.\n"
         f"Ваш логин: <b>{username_tag}</b>",
         reply_markup=confirm_kb,
@@ -1053,9 +1107,11 @@ async def process_uah_selection(callback: CallbackQuery):
         ]
     )
 
+    # 🔗 Исправлено: выдаем ссылку на банку Monobank вместо номера карты
     await callback.message.edit_text(
         f"💳 <b>Оплата VIP ({info['text']})</b>\n\n"
-        f"Переведите <b>{info['price']} грн</b> на карту:\n<code>{CARD_DETAILS}</code>\n\n"
+        f"Переведите <b>{info['price']} грн</b> по ссылке на банку Monobank:\n"
+        f"🔗 {MONOBANK_JAR}\n\n"
         "После перевода нажмите кнопку <b>«Я оплатил(а)»</b> ниже.",
         reply_markup=confirm_kb,
         parse_mode="HTML"
@@ -1711,7 +1767,7 @@ async def cmd_ungwarn(message: Message, command: CommandObject):
     user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
     if user[3] < 7: return await message.answer("❌ Доступно с 7+ ранга.")
     if not command.args or not command.args.isdigit():
-        return await message.answer("⚠️️ Укажите ID пользователя: <code>/ungwarn 123456789</code>", parse_mode="HTML")
+        return await message.answer("⚠ Укажите ID пользователя: <code>/ungwarn 123456789</code>", parse_mode="HTML")
     
     tid = int(command.args)
     cursor.execute("DELETE FROM global_warns WHERE user_id = ?", (tid,))
