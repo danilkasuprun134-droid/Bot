@@ -90,7 +90,9 @@ def init_db():
         warns INTEGER DEFAULT 0,
         gwarns INTEGER DEFAULT 0,
         role TEXT DEFAULT 'User',
-        zdkd INTEGER DEFAULT 0
+        zdkd INTEGER DEFAULT 0,
+        last_active TEXT,
+        last_command TEXT
     )''')
 
     cursor.execute('''CREATE TABLE IF NOT EXISTS global_bans (
@@ -194,6 +196,28 @@ def init_db():
         reason TEXT,
         date TEXT
     )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS obnyl_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        old_coins INTEGER,
+        old_exp INTEGER,
+        old_level INTEGER,
+        old_rep INTEGER,
+        old_rank INTEGER,
+        date TEXT
+    )''')
+
+    # Проверка столбцов для версий БД, созданных ранее
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_active TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_command TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
 
@@ -378,7 +402,16 @@ async def global_middleware(handler, event: Message, data):
             return
 
     user = get_user(user_id=user_id, username=username)
-    update_user(user_id, msg_count=user[14] + 1)
+    
+    # Трекинг сообщений и последней активности пользователя
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    last_cmd = event.text if event.text else "Сообщение/Медиа"
+    
+    cursor.execute(
+        "UPDATE users SET msg_count = msg_count + 1, last_active = ?, last_command = ? WHERE user_id = ?",
+        (now_str, last_cmd, user_id)
+    )
+    conn.commit()
 
     return await handler(event, data)
 
@@ -534,7 +567,7 @@ async def cmd_profile(message: Message, command: CommandObject):
         user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
 
     if user:
-        u_id, u_name, _, rank, _, coins, exp, level, rep, _, _, _, _, vip_until, msg_cnt, duel_wins, nickname, _, _, _, role, zdkd = user
+        u_id, u_name, _, rank, _, coins, exp, level, rep, _, _, _, _, vip_until, msg_cnt, duel_wins, nickname, _, _, _, role, zdkd, *_ = user
         gban_status = " | 🚨 <b>ИМЕЕТ GBAN</b>" if check_gban(u_id) else ""
         zdkd_status = " | 🚫 <b>ЗДКД активен</b>" if zdkd else ""
         await message.answer(
@@ -601,6 +634,10 @@ async def cmd_help(message: Message):
         "<b>🛡️ 2. Модерация & Управление:</b>\n"
         "• <code>/snick</code>, <code>/rnick</code>, <code>/gnick</code> — Управление никами (2+)\n"
         "• <code>/nonick</code> — Пользователи без ника (2+)\n"
+        "• <code>/zov [причина]</code> — Вызов участников (3+)\n"
+        "• <code>/news</code> — Правила бота\n"
+        "• <code>/olist</code> — Пользователи в сети в группе (5+)\n"
+        "• <code>/olists</code> — Полная история взаимодействий с ботом (8+)\n"
         "• <code>/staff</code> — Состав модерации (1+)\n"
         "• <code>/warn</code>, <code>/mute</code>, <code>/kick</code>, <code>/ban</code> (4+)\n"
         "• <code>/skick</code>, <code>/sban</code> — Массовые кики/баны по группам (5+)\n"
@@ -609,6 +646,9 @@ async def cmd_help(message: Message):
         "• <code>/gwarn</code> (8+), <code>/zdkd</code> (9+)\n"
         "• <code>/setga</code>, <code>/unsetga</code>, <code>/settex</code>, <code>/unsettex</code> (8+)\n"
         "• <code>/checkrep</code>, <code>/ghrep</code> (8+)\n"
+        "• <code>/odnyllist</code> — История обнулений (8+)\n"
+        "• <code>/Obnyl_money</code> — Обнуление баланса (9+)\n"
+        "• <code>/Obnyl</code> — Полное обнуление аккаунта (10+)\n"
         "• <code>/zayavka</code>, <code>/Ovip</code>, <code>/Omoney</code>, <code>/Bmomey</code> (8-10+)\n"
         "• <code>/give_money</code>, <code>/givevip</code>, <code>/Global_news</code> (10+)\n"
         "• Логи: <code>/Pbook</code>, <code>/Pbooks</code>, <code>/book</code>, <code>/books</code>, <code>/book_global</code>\n"
@@ -698,7 +738,6 @@ async def cmd_transfer(message: Message, command: CommandObject):
     amount = int(command.args)
     sender = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
     
-    # 📌 Изменено: суточный лимит 1000 монет без VIP, 10000 монет с VIP
     limit = 10000 if is_vip(sender) else 1000
 
     if amount > limit:
@@ -752,7 +791,6 @@ async def cmd_duel(message: Message, command: CommandObject):
 @dp.message(Command("givemevip"))
 async def cmd_givemevip(message: Message):
     user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
-    # 📌 Изменено: выдать себе VIP на 7 дней может только 8+ ранг
     if user[3] < 8 and message.from_user.id not in ADMIN_IDS:
         return await message.answer("❌ Команда доступна только администраторам с 8+ ранга!")
 
@@ -1217,7 +1255,6 @@ async def cmd_skick(message: Message, command: CommandObject):
     for ch in chats:
         c_id = ch[0]
         try:
-            # 📌 Проверка прав администратора перед выполнением
             member = await bot.get_chat_member(c_id, message.from_user.id)
             if member.status in ['administrator', 'creator']:
                 await bot.ban_chat_member(c_id, target_id)
@@ -1248,7 +1285,6 @@ async def cmd_sban(message: Message, command: CommandObject):
     for ch in chats:
         c_id = ch[0]
         try:
-            # 📌 Проверка наличия прав админа 5+ в группах
             member = await bot.get_chat_member(c_id, message.from_user.id)
             if member.status in ['administrator', 'creator']:
                 await bot.ban_chat_member(c_id, target_id)
@@ -1435,9 +1471,12 @@ async def cmd_global_news(message: Message, command: CommandObject):
     news_text = f"📢 <b>ПРАВИЛА / НОВОСТИ СИСТЕМЫ:</b>\n\n{command.args}"
     
     cursor.execute("SELECT chat_id FROM known_chats")
-    for ch in cursor.fetchall():
+    chats = cursor.fetchall()
+    for ch in chats:
+        cursor.execute("INSERT OR REPLACE INTO chat_settings (chat_id, rules) VALUES (?, ?)", (ch[0], command.args))
         try: await bot.send_message(ch[0], news_text, parse_mode="HTML")
         except Exception: pass
+    conn.commit()
         
     cursor.execute("SELECT user_id FROM users")
     for u in cursor.fetchall():
@@ -1447,7 +1486,215 @@ async def cmd_global_news(message: Message, command: CommandObject):
     await message.answer("✅ Рассылка успешно завершена!")
 
 # ==========================================
-# 11. ЗАПУСК БОТА
+# 11. КОМАНДЫ ЗОВ, НОВОСТИ, ОБНУЛЕНИЯ И АКТИВНОСТЬ
+# ==========================================
+
+@dp.message(Command("zov"))
+async def cmd_zov(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
+    if user[3] < 3:
+        return await message.answer("❌ Команда /zov доступна модераторам с 3+ ранга!")
+
+    if not command.args:
+        return await message.answer("⚠️ Укажите причину вызова: <code>/zov Важная причина</code>", parse_mode="HTML")
+
+    reason = command.args
+    await message.answer(
+        f"📢 <b>ВЫЗОВ УЧАСТНИКОВ (ОПОВЕЩЕНИЕ)!</b>\n\n"
+        f"👤 <b>Вызвал:</b> @{message.from_user.username or message.from_user.id}\n"
+        f"💬 <b>Причина:</b> {reason}\n\n"
+        f"🔔 @everyone @online",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("news"))
+async def cmd_news(message: Message):
+    cursor.execute("SELECT rules FROM chat_settings WHERE chat_id = ?", (message.chat.id,))
+    row = cursor.fetchone()
+    rules_text = row[0] if row and row[0] else "Правила системы пока не установлены администрацией."
+
+    await message.answer(
+        f"📜 <b>ПРАВИЛА И УСТАВ БОТА:</b>\n\n{rules_text}",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("Obnyl"))
+async def cmd_obnyl(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 10:
+        return await message.answer("❌ Полное обнуление доступно строго Владельцу (10 ранг)!")
+
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/Obnyl @username</code> или <code>/Obnyl ID</code>", parse_mode="HTML")
+
+    target_raw = command.args.split()[0]
+    
+    if target_raw.isdigit():
+        target_user = get_user(user_id=int(target_raw))
+    else:
+        target_user = get_user(username=clean_username(target_raw))
+
+    if not target_user:
+        return await message.answer("❌ Пользователь не найден в базе данных!")
+
+    target_uid = target_user[0]
+    target_un = target_user[1] or f"ID:{target_uid}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    cursor.execute(
+        "INSERT INTO obnyl_history (user_id, username, old_coins, old_exp, old_level, old_rep, old_rank, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (target_uid, target_un, target_user[5], target_user[6], target_user[7], target_user[8], target_user[3], now_str)
+    )
+    conn.commit()
+
+    update_user(
+        target_uid,
+        coins=0,
+        exp=0,
+        level=1,
+        rep=0,
+        streak=0,
+        msg_count=0,
+        duel_wins=0,
+        warns=0,
+        gwarns=0,
+        custom_nickname="",
+        rank=0 if target_uid != OWNER_ID else 10,
+        role="User" if target_uid != OWNER_ID else "Owner"
+    )
+
+    await message.answer(
+        f"💥 <b>ПОЛНОЕ ОБНУЛЕНИЕ АККАУНТА!</b>\n\n"
+        f"👤 Аккаунт: @{target_un} (<code>{target_uid}</code>)\n"
+        f"✅ Все монеты, EXP, уровень, репутация, ранги и статистика сброшены.\n"
+        f"👑 <i>Купленный VIP-статус сохранен.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("Obnyl_money"))
+async def cmd_obnyl_money(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 9:
+        return await message.answer("❌ Обнуление баланса доступно с 9+ ранга!")
+
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/Obnyl_money @username</code> или <code>/Obnyl_money ID</code>", parse_mode="HTML")
+
+    target_raw = command.args.split()[0]
+    
+    if target_raw.isdigit():
+        target_user = get_user(user_id=int(target_raw))
+    else:
+        target_user = get_user(username=clean_username(target_raw))
+
+    if not target_user:
+        return await message.answer("❌ Пользователь не найден в базе данных!")
+
+    target_uid = target_user[0]
+    target_un = target_user[1] or f"ID:{target_uid}"
+    old_coins = target_user[5]
+
+    update_user(target_uid, coins=0)
+
+    await message.answer(
+        f"💰 <b>ОБНУЛЕНИЕ БАЛАНСА!</b>\n\n"
+        f"👤 Пользователь: @{target_un} (<code>{target_uid}</code>)\n"
+        f"📉 Баланс сброшен с <b>{old_coins} монет</b> до <b>0</b>.",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("odnyllist"))
+async def cmd_odnyllist(message: Message, command: CommandObject):
+    user = get_user(user_id=message.from_user.id)
+    if message.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return await message.answer("❌ Просмотр истории обнулений доступен с 8+ ранга!")
+
+    if not command.args:
+        return await message.answer("⚠️ Использование: <code>/odnyllist @username</code> или <code>/odnyllist ID</code>", parse_mode="HTML")
+
+    target_raw = command.args.split()[0]
+    
+    if target_raw.isdigit():
+        target_uid = int(target_raw)
+        cursor.execute("SELECT * FROM obnyl_history WHERE user_id = ? ORDER BY id DESC LIMIT 10", (target_uid,))
+    else:
+        u_clean = clean_username(target_raw)
+        cursor.execute("SELECT * FROM obnyl_history WHERE LOWER(username) = ? ORDER BY id DESC LIMIT 10", (u_clean,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await message.answer("📋 Данный пользователь ни разу не подвергался полному обнулению.")
+
+    text = f"📋 <b>ИСТОРИЯ ОБНУЛЕНИЙ ДЛЯ {target_raw}:</b>\n\n"
+    for r in rows:
+        text += (
+            f"📅 <b>Дата:</b> {r[8]}\n"
+            f"💰 Монет было: {r[3]}\n"
+            f"⚡ EXP было: {r[4]} (Уровень {r[5]})\n"
+            f"⭐ Репутации было: {r[6]}\n"
+            f"🎭 Админ-ранг был: {r[7]}\n"
+            f"-----------------------------------\n"
+        )
+
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("olist"))
+async def cmd_olist(message: Message):
+    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
+    if message.from_user.id not in ADMIN_IDS and user[3] < 5:
+        return await message.answer("❌ Команда /olist доступна с 5+ ранга!")
+
+    if message.chat.type not in ['group', 'supergroup']:
+        return await message.answer("❌ Команда /olist работает только в группах.")
+
+    cursor.execute("""
+        SELECT username, user_id, last_active 
+        FROM users 
+        WHERE last_active IS NOT NULL 
+        ORDER BY last_active DESC LIMIT 30
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await message.answer("📋 В сети сейчас никого нет или данные не собраны.")
+
+    text = f"🟢 <b>СПИСОК УЧАСТНИКОВ В СЕТИ (ЧАТ):</b>\n\n"
+    for r in rows:
+        uname = f"@{r[0]}" if r[0] else "без_юзернейма"
+        text += f"• {uname} | <code>{r[1]}</code> | Был(а) в сети: {r[2]}\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("olists"))
+async def cmd_olists(message: Message):
+    user = get_user(user_id=message.from_user.id, username=message.from_user.username or "")
+    if message.from_user.id not in ADMIN_IDS and user[3] < 8:
+        return await message.answer("❌ Команда /olists доступна с 8+ ранга!")
+
+    cursor.execute("""
+        SELECT username, user_id, last_active, last_command 
+        FROM users 
+        WHERE last_active IS NOT NULL 
+        ORDER BY last_active DESC LIMIT 50
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await message.answer("📋 В базе данных пока нет зафиксированной активности.")
+
+    text = "📋 <b>РЕЕСТР ВСЕХ ВЗАИМОДЕЙСТВИЙ С БОТОМ:</b>\n\n"
+    for r in rows:
+        uname = f"@{r[0]}" if r[0] else "без_юзернейма"
+        last_act = r[2] or "Неизвестно"
+        last_cmd = r[3] or "Нет данных"
+        
+        text += f"{uname}  <code>{r[1]}</code>  {last_act}  {last_cmd}\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+# ==========================================
+# 12. ЗАПУСК БОТА
 # ==========================================
 async def main():
     logging.info("Starting Stars Manager Bot...")
