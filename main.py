@@ -927,31 +927,67 @@ async def blago_stars_callback(callback: CallbackQuery):
     buttons = []
     row = []
     for stars in STARS_PACKS:
-        row.append(InlineKeyboardButton(text=f"⭐️ {stars}", callback_data=f"blago_star_{stars}"))
+        row.append(InlineKeyboardButton(text=f"⭐️ {stars}", callback_data=f"buy_star_invoice_{stars}"))
         if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
     
-    await callback.message.edit_text("⭐️ <b>Выберите количество Звезд для доната:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await callback.message.edit_text(
+        "⭐️ <b>Выберите количество Звезд для доната:</b>\n\n"
+        "<i>При нажатии откроется официальное окно оплаты Telegram.</i>", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), 
+        parse_mode="HTML"
+    )
 
-@dp.callback_query(F.data.startswith("blago_star_"))
-async def process_blago_star_choice(callback: CallbackQuery):
-    stars_count = int(callback.data.split("_")[2])
-    uid = callback.from_user.id
-    uname = callback.from_user.username or f"ID:{uid}"
-    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+@dp.callback_query(F.data.startswith("buy_star_invoice_"))
+async def process_buy_star_invoice(callback: CallbackQuery):
+    stars_count = int(callback.data.split("_")[3])
+    
+    prices = [LabeledPrice(label=f"Донат {stars_count} Звезд⭐️", amount=stars_count)]
+    
+    try:
+        await callback.message.answer_invoice(
+            title="Поддержка проекта⭐️",
+            description=f"Добровольное пожертвование разработчику в размере {stars_count} Telegram Stars.",
+            payload=f"donate_stars_{stars_count}",
+            currency="XTR",
+            prices=prices
+        )
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка создания счета: {e}", show_alert=True)
 
-    user = get_user(user_id=uid)
-    current_stars = user[26] if len(user) > 26 and user[26] else 0
-    update_user(uid, total_donated_stars=current_stars + stars_count)
+@dp.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-    cursor.execute("INSERT INTO donats_history (user_id, username, type, amount, currency, date) VALUES (?, ?, ?, ?, ?, ?)",
-                   (uid, uname, "Донат Stars", f"{stars_count} Звезд", "Stars", date_str))
-    conn.commit()
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payment = message.successful_payment
+    if payment.invoice_payload.startswith("donate_stars_"):
+        stars_count = int(payment.invoice_payload.split("_")[2])
+        uid = message.from_user.id
+        uname = message.from_user.username or f"ID:{uid}"
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    await callback.message.edit_text(f"✅ Спасибо большое! Вы успешно задонатили <b>{stars_count} Звезд⭐️</b>. Они автоматически учтены в вашей статистике покупок (/Donats)!", parse_mode="HTML")
+        user = get_user(user_id=uid)
+        current_stars = user[26] if len(user) > 26 and user[26] else 0
+        update_user(uid, total_donated_stars=current_stars + stars_count)
+
+        cursor.execute(
+            "INSERT INTO donats_history (user_id, username, type, amount, currency, date) VALUES (?, ?, ?, ?, ?, ?)",
+            (uid, uname, "Донат Stars", f"{stars_count} Звезд", "Stars", date_str)
+        )
+        conn.commit()
+
+        await message.answer(
+            f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+            f"Спасибо огромное за донат в <b>{stars_count} Звезд⭐️</b>!\n"
+            f"Платеж зачтен в вашу статистику покупок (`/Donats`). ❤️",
+            parse_mode="HTML"
+        )
 
 @dp.message(Command("Donats"))
 async def cmd_donats(message: Message):
